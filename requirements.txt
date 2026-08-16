@@ -1,0 +1,18 @@
+# Nexus Optimizer - pinned version ranges.
+# The upper bounds guard against silent API breakage (rewrite_images in PyMuPDF,
+# for one).
+customtkinter>=5.2.2,<5.3
+pillow>=10.4,<12
+pymupdf>=1.24.14,<1.27
+pikepdf>=9.4,<10
+tkinterdnd2>=0.4.2,<0.5
+imageio-ffmpeg>=0.5.1,<0.7
+comtypes>=1.4.6,<1.6
+pillow-heif>=0.18,<2.0
+pyinstaller>=6.10,<7.0
+
+# pytwain is deliberately absent: it is distributed strictly under GPL-2.0, with
+# no "or later", which is incompatible with both AGPL-3.0 (PyMuPDF) and GPL-3.0
+# (FFmpeg). TWAIN works through a first-party ctypes binding to twaindsm.dll in
+# NexusPDFOptimizer.py, which inherits nobody's terms because it implements the
+# public TWAIN specification.

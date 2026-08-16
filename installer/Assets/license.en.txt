@@ -1,0 +1,25 @@
+Nexus Optimizer
+
+Copyright (c) 2026 Artur Yurchuk.
+
+Nexus Optimizer is free software: you can use, study, modify and redistribute it
+under the terms of the GNU Affero General Public License version 3, as published
+by the Free Software Foundation.
+
+The full licence text is in LICENSE.txt, installed alongside the program.
+
+The source code is published at https://github.com/skin4ik123/NexusOptimizer and
+is linked from https://nexus.internetdeco.com — you are entitled to it, and it is
+the same code these binaries were built from.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the licence for details.
+
+Nexus Optimizer compresses your files on your own computer and never uploads
+them. Originals are preserved until you decide otherwise. Logs are kept only on
+your own device.
+
+Third-party components are listed in THIRD_PARTY_NOTICES.md, installed together
+with the program, under their own licences. Notably: MuPDF (AGPL-3.0), FFmpeg
+(GPL-3.0) and the TWAIN Data Source Manager (LGPL-2.1-or-later).

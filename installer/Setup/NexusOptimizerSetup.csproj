@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>NexusOptimizerSetup</AssemblyName>
+    <RootNamespace>NexusOptimizer.Setup</RootNamespace>
+    <ApplicationIcon>..\Assets\app.ico</ApplicationIcon>
+    <Company>Artur Yurchuk</Company>
+    <Product>Nexus Optimizer</Product>
+    <Copyright>Copyright (c) 2026 Artur Yurchuk</Copyright>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DebugType>embedded</DebugType>
+    <!-- build_installer.ps1 passes -p:Version and -p:MsiPath. Without MsiPath a
+         development build is produced that reports the missing package. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="$(MsiPath)" Condition="'$(MsiPath)' != ''"
+                      LogicalName="NexusOptimizer.Setup.Payload.NexusOptimizer.msi"
+                      Link="Payload\NexusOptimizer.msi"/>
+    <!-- WithCulture=false is required: MSBuild reads the ".en." in
+         license.en.txt as a culture and moves the file into a satellite
+         assembly, leaving the installer with an empty licence page. -->
+    <EmbeddedResource Include="$(MSBuildThisFileDirectory)..\Assets\license.en.txt"
+                      Link="Payload\license.txt"
+                      WithCulture="false"
+                      LogicalName="NexusOptimizer.Setup.Payload.license.txt"/>
+  </ItemGroup>
+
+</Project>

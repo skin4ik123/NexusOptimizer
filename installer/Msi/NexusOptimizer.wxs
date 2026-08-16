@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Nexus Optimizer MSI package (WiX 5). Built by build_installer.ps1; the version
+  is passed in from APP_VERSION so it lives in exactly one place. The package a
+  user sees is NexusOptimizerSetup.exe, a WPF front end over this MSI;
+  WixUI_InstallDir below is the fallback for running the MSI directly.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="Nexus Optimizer"
+           Manufacturer="Artur Yurchuk"
+           Version="$(Version)"
+           UpgradeCode="9F2C41D7-6B58-4E93-A2F1-7C0D5E8B3A44"
+           Language="1033"
+           Scope="perUserOrMachine">
+
+    <!-- Reinstalling the same version must replace the installed copy, not sit
+         beside it; the old copy goes before the new files are laid down. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of Nexus Optimizer is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high"/>
+
+    <Property Id="DESKTOP_SHORTCUT" Value="0"/>
+    <Property Id="CONTEXT_MENU" Value="1"/>
+
+    <Icon Id="AppIco" SourceFile="!(bindpath.assets)\app.ico"/>
+    <Property Id="ARPPRODUCTICON" Value="AppIco"/>
+    <Property Id="ARPCOMMENTS" Value="Compress PDFs, photos and video locally. Crafted by Artur Yurchuk."/>
+    <Property Id="ARPCONTACT" Value="Artur Yurchuk"/>
+    <Property Id="ARPNOREPAIR" Value="1"/>
+    <Property Id="ARPURLINFOABOUT" Value="https://nexus.internetdeco.com"/>
+
+    <WixVariable Id="WixUILicenseRtf" Value="!(bindpath.assets)\license.en.rtf"/>
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER"/>
+
+    <!-- Close a running copy first, otherwise Windows asks for a restart and
+         the _internal folder ends up holding a mix of two versions. -->
+    <util:CloseApplication Id="CloseRunningApp" Target="NexusOptimizer.exe"
+                           CloseMessage="yes" RebootPrompt="no" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Nexus Optimizer"/>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder"/>
+    <StandardDirectory Id="DesktopFolder"/>
+
+    <!-- The whole PyInstaller onedir build: exe plus _internal. -->
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Files Include="!(bindpath.payload)\**"/>
+    </ComponentGroup>
+
+    <ComponentGroup Id="Shortcuts" Directory="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut">
+        <Shortcut Id="AppShortcut" Name="Nexus Optimizer"
+                  Target="[INSTALLFOLDER]NexusOptimizer.exe"
+                  WorkingDirectory="INSTALLFOLDER" Icon="AppIco"/>
+        <RegistryValue Root="HKMU" Key="Software\NexusOptimizer" Name="startMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes"/>
+      </Component>
+      <!-- Some Windows 11 builds do not list a per-user install under Installed
+           apps; the Start menu entry always works. -->
+      <Component Id="UninstallShortcut">
+        <Shortcut Id="AppUninstallShortcut" Name="Uninstall Nexus Optimizer"
+                  Target="[System64Folder]msiexec.exe"
+                  Arguments="/x [ProductCode]"/>
+        <RegistryValue Root="HKMU" Key="Software\NexusOptimizer" Name="uninstallShortcut"
+                       Type="integer" Value="1" KeyPath="yes"/>
+      </Component>
+      <Component Id="DesktopShortcut" Directory="DesktopFolder" Condition="DESKTOP_SHORTCUT=1">
+        <Shortcut Id="AppDesktopShortcut" Name="Nexus Optimizer"
+                  Target="[INSTALLFOLDER]NexusOptimizer.exe"
+                  WorkingDirectory="INSTALLFOLDER" Icon="AppIco"/>
+        <RegistryValue Root="HKMU" Key="Software\NexusOptimizer" Name="desktopShortcut"
+                       Type="integer" Value="1" KeyPath="yes"/>
+      </Component>
+    </ComponentGroup>
+
+    <!-- Uninstall leaves nothing behind: settings, history and log go too.
+         Declared as a real installation directory rather than through
+         util:RemoveFolderEx, which never reached settings.json. -->
+    <StandardDirectory Id="AppDataFolder">
+      <Directory Id="NexusDataDir" Name="NexusOptimizer"/>
+    </StandardDirectory>
+
+    <ComponentGroup Id="DataCleanup">
+      <!-- NOT UPGRADINGPRODUCTCODE is required: an upgrade removes the previous
+           version the same way, and without it every upgrade would wipe the
+           user's settings and history. -->
+      <Component Id="DataCleanupComponent" Directory="NexusDataDir"
+                 Guid="D5A83F61-7C24-4B98-9E17-6F2A0B44C7D3"
+                 Condition="NOT UPGRADINGPRODUCTCODE">
+        <RegistryValue Root="HKCU" Key="Software\NexusOptimizer" Name="dataCleanup"
+                       Type="integer" Value="1" KeyPath="yes"/>
+        <RemoveFile Id="RemoveDataFiles" Name="*" On="uninstall"/>
+        <RemoveFolder Id="RemoveDataDir" On="uninstall"/>
+      </Component>
+    </ComponentGroup>
+
+    <!-- The Explorer menu keys are written by the application itself, from
+         NexusOptimizerSetup.exe after the install: a deferred custom action runs
+         inside the installer service and writes to a different HKCU hive.
+         Declaring the keys here as well gives Windows Installer something to
+         remove when the product is uninstalled from Installed apps.
+         Each key carries a nested value on purpose — without one WiX moves it
+         into an auto-generated component that never gets installed. -->
+    <ComponentGroup Id="MenuCleanup" Directory="INSTALLFOLDER">
+      <Component Id="MenuKeysCleanup" Guid="4C1D8E23-59A7-4F0B-B6E2-1A93D7C5E480"
+                 Condition="CONTEXT_MENU=1">
+        <RegistryValue Root="HKCU" Key="Software\NexusOptimizer" Name="menuCleanup"
+                       Type="integer" Value="1" KeyPath="yes"/>
+        <RegistryKey Root="HKCU" Key="Software\Classes\*\shell\NexusOptimizer.Compress"
+                     ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player"/>
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Classes\Directory\shell\NexusOptimizer.Compress"
+                     ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player"/>
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Classes\Applications\NexusOptimizer.exe"
+                     ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="FriendlyAppName" Type="string" Value="Nexus Optimizer"/>
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Classes\NexusOptimizer.File"
+                     ForceDeleteOnUninstall="yes">
+          <RegistryValue Type="string" Value="Nexus Optimizer"/>
+        </RegistryKey>
+        <RemoveFile Id="RemoveSendToShortcut" Directory="SendToFolder"
+                    Name="Compress with Nexus Optimizer.lnk" On="uninstall"/>
+      </Component>
+    </ComponentGroup>
+
+    <!-- The application removes its own menu branch on uninstall: a verb key has
+         a command subkey and Windows Installer deletes keys non-recursively. -->
+    <CustomAction Id="UnregisterMenuCmd" Property="UnregisterMenu"
+                  Value="&quot;[INSTALLFOLDER]NexusOptimizer.exe&quot; --unregister-menu"
+                  Execute="immediate"/>
+    <CustomAction Id="UnregisterMenu" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
+                  Execute="deferred" Return="ignore" Impersonate="yes"/>
+
+    <!-- Windows 11 24H2 and later show only the system-wide (HKLM) entry. It
+         needs elevation, so it runs for all-users installs, where the process is
+         already elevated. A per-user install offers the same step from
+         Setup.exe with a single UAC prompt. -->
+    <CustomAction Id="RegisterMenuHklmCmd" Property="RegisterMenuHklm"
+                  Value="&quot;[INSTALLFOLDER]NexusOptimizer.exe&quot; --register-menu-hklm"
+                  Execute="immediate"/>
+    <CustomAction Id="RegisterMenuHklm" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
+                  Execute="deferred" Return="ignore" Impersonate="no"/>
+
+    <CustomAction Id="UnregisterMenuHklmCmd" Property="UnregisterMenuHklm"
+                  Value="&quot;[INSTALLFOLDER]NexusOptimizer.exe&quot; --unregister-menu-hklm"
+                  Execute="immediate"/>
+    <CustomAction Id="UnregisterMenuHklm" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
+                  Execute="deferred" Return="ignore" Impersonate="no"/>
+
+    <InstallExecuteSequence>
+      <!-- Unregistering runs before the files go: the exe is still in place. -->
+      <Custom Action="UnregisterMenuCmd" Before="UnregisterMenu"
+              Condition="REMOVE=&quot;ALL&quot;"/>
+      <Custom Action="UnregisterMenu" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot;"/>
+      <Custom Action="UnregisterMenuHklmCmd" Before="UnregisterMenuHklm"
+              Condition="REMOVE=&quot;ALL&quot; AND ALLUSERS"/>
+      <Custom Action="UnregisterMenuHklm" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND ALLUSERS"/>
+
+      <Custom Action="RegisterMenuHklmCmd" Before="RegisterMenuHklm"
+              Condition="NOT REMOVE AND CONTEXT_MENU=1 AND ALLUSERS"/>
+      <Custom Action="RegisterMenuHklm" After="InstallFiles"
+              Condition="NOT REMOVE AND CONTEXT_MENU=1 AND ALLUSERS"/>
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="Nexus Optimizer" Level="1">
+      <ComponentGroupRef Id="AppFiles"/>
+      <ComponentGroupRef Id="Shortcuts"/>
+      <ComponentGroupRef Id="MenuCleanup"/>
+      <ComponentGroupRef Id="DataCleanup"/>
+    </Feature>
+  </Package>
+</Wix>
