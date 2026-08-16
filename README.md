@@ -59,6 +59,19 @@ just as much as money.
 
 Interface in Russian and English, light and dark themes following Windows.
 
+## The installer
+
+<div align="center">
+
+<img src="docs/images/installer.png" alt="Nexus Optimizer installer" width="760">
+
+</div>
+
+Installs for the current user without administrator rights, or for everyone.
+It upgrades a copy left by the previous (Inno Setup) installer, keeping settings
+and history, and uninstalling removes the program, its shortcuts, the Explorer
+menu entry and the settings folder.
+
 ## Privacy
 
 Files are processed locally and never uploaded. There is no account, no licence
