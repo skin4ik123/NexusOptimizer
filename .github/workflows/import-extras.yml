@@ -1,0 +1,28 @@
+name: Recover current build assets
+on:
+  push:
+    branches: [codex/import-nexusoptimizer-drive-20261010]
+    paths: [.github/workflows/import-extras.yml]
+permissions:
+  contents: read
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract original build assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y unrar
+          mkdir -p archive extras
+          gh release download drive-import-20261010 --pattern NexusOptimizer.rar --dir archive
+          unrar x -idq archive/NexusOptimizer.rar NexusOptimizer/NexusOptimizer.spec NexusOptimizer/installer/Assets/license.en.rtf NexusOptimizer/scanner/twain/x64/TWAINDSM.dll NexusOptimizer/scanner/twain/x86/TWAINDSM.dll extras/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexusoptimizer-build-assets
+          path: extras/
+          if-no-files-found: error
+          retention-days: 14
