@@ -4,7 +4,7 @@ on:
     branches: [codex/import-nexusoptimizer-drive-20261010]
     paths: [.github/workflows/import-extras.yml]
 permissions:
-  contents: read
+  contents: write
 jobs:
   extract:
     runs-on: ubuntu-latest
