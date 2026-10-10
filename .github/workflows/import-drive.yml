@@ -1,0 +1,148 @@
+name: Import NexusOptimizer archive from Drive
+
+on:
+  push:
+    branches: [codex/import-nexusoptimizer-drive-20261010]
+    paths: [.github/workflows/import-drive.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nexusoptimizer-drive-import
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install archive download and inspection tools
+        run: |
+          python -m pip install 'gdown>=5,<6' 'rarfile>=4,<5'
+          sudo apt-get update -qq
+          sudo apt-get install -y unrar
+
+      - name: Download the original archive and verify it
+        run: |
+          mkdir -p archive source
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          import gdown
+
+          path = Path("archive/NexusOptimizer.rar")
+          result = gdown.download(
+              id="1JTtTvQ_9qA_jgB8OGYgqd2csehAj1rcd",
+              output=str(path),
+              quiet=False,
+              resume=True,
+          )
+          if result is None or not path.exists():
+              raise RuntimeError("Google Drive did not return the archive")
+          actual_size = path.stat().st_size
+          if actual_size != 531749154:
+              raise RuntimeError(f"Incomplete archive: {actual_size} bytes")
+          with path.open("rb") as stream:
+              signature = stream.read(8)
+          if not signature.startswith(b"Rar!\x1a\x07"):
+              raise RuntimeError("Downloaded response is not a RAR archive")
+          digest = hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+          report = (
+              "Original NexusOptimizer archive imported from the user's Google Drive link.\n"
+              "File: NexusOptimizer.rar\n"
+              f"Size: {actual_size} bytes\n"
+              f"SHA-256: {digest}\n"
+              "This is a source archive transfer, not a new application release.\n"
+          )
+          Path("archive/import-report.txt").write_text(report, encoding="utf-8")
+          print(report)
+          PY
+
+      - name: Store the original archive as a draft release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=drive-import-20261010
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" --draft \
+              --title "NexusOptimizer archive from Google Drive" \
+              --notes-file archive/import-report.txt
+          fi
+          gh release upload "$tag" archive/NexusOptimizer.rar archive/import-report.txt --clobber
+
+      - name: Inspect the archive and extract a bounded source bundle
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path, PurePosixPath
+          import rarfile
+
+          excluded = {
+              ".git", ".vs", ".idea", "bin", "obj", "node_modules", "packages",
+              "venv", ".venv", "__pycache__", "artifacts", "publish", "dist",
+              "tessdata", "models", "runtimes"
+          }
+          extensions = {
+              ".cs", ".csproj", ".sln", ".slnx", ".props", ".targets", ".xaml",
+              ".py", ".pyw", ".toml", ".ini", ".cfg", ".json", ".yaml", ".yml",
+              ".md", ".txt", ".ps1", ".sh", ".bat", ".cmd", ".c", ".cpp", ".h",
+              ".hpp", ".rc", ".wxs", ".xml", ".resx", ".js", ".ts", ".tsx",
+              ".jsx", ".html", ".css", ".scss", ".lock", ".manifest", ".def",
+              ".iss", ".wixproj", ".config", ".nuspec", ".ico", ".svg", ".png",
+              ".jpg", ".jpeg", ".bmp", ".gif", ".ttf", ".otf"
+          }
+          selected, listing, total = [], [], 0
+          with rarfile.RarFile("archive/NexusOptimizer.rar") as archive:
+              for item in archive.infolist():
+                  name = item.filename.replace("\\", "/")
+                  path = PurePosixPath(name)
+                  listing.append({"path": name, "size": item.file_size,
+                                  "directory": item.isdir()})
+                  if item.isdir() or item.is_symlink():
+                      continue
+                  if (path.is_absolute() or ".." in path.parts or ":" in name
+                      or name.startswith(("-", "@")) or "\n" in name or "\r" in name):
+                      continue
+                  if any(part.lower() in excluded for part in path.parts):
+                      continue
+                  if path.suffix.lower() not in extensions and path.name not in {
+                      ".gitignore", ".editorconfig", "LICENSE", "Dockerfile"
+                  }:
+                      continue
+                  if item.file_size > 8 * 1024 * 1024:
+                      continue
+                  total += item.file_size
+                  if total > 128 * 1024 * 1024:
+                      raise RuntimeError("Selected sources exceed 128 MiB; inspect the manifest")
+                  selected.append(item.filename)
+          Path("archive/archive-manifest.json").write_text(
+              json.dumps(listing, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          if selected:
+              Path("selected-sources.txt").write_text(
+                  "\n".join(selected) + "\n", encoding="utf-8"
+              )
+              subprocess.run([
+                  "unrar", "x", "-idq", "-o-", "archive/NexusOptimizer.rar",
+                  "@selected-sources.txt", "source/"
+              ], check=True)
+          print(f"Archive entries: {len(listing)}")
+          print(f"Selected source files: {len(selected)} ({total} bytes)")
+          PY
+
+      - name: Upload extracted source and archive manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexusoptimizer-drive-sources
+          path: |
+            source/
+            archive/archive-manifest.json
+            archive/import-report.txt
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
