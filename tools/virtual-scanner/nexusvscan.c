@@ -54,7 +54,7 @@ static int e_pages = 3, e_empty, e_jam_at, e_crash_at, e_hang_at;
 static double e_skew;
 static int e_blank_backs, e_ui_auto, e_ui_required, e_offline, e_legacy;
 static int e_delay_ms = 150;
-static int e_initial_duplex, e_feeder_sets_duplex, e_refuse_simplex, e_ignore_simplex, e_no_duplex;
+static int e_initial_duplex, e_feeder_sets_duplex, e_paper_sets_duplex, e_refuse_simplex, e_ignore_simplex, e_no_duplex;
 static char e_log[MAX_PATH];
 
 /* capabilities */
@@ -131,6 +131,7 @@ static void read_env(void)
     e_delay_ms = env_int("NEXUS_VSCAN_DELAY_MS", 150);
     e_initial_duplex = env_int("NEXUS_VSCAN_INITIAL_DUPLEX", 0);
     e_feeder_sets_duplex = env_int("NEXUS_VSCAN_FEEDER_SETS_DUPLEX", 0);
+    e_paper_sets_duplex = env_int("NEXUS_VSCAN_PAPER_SETS_DUPLEX", 0);
     e_refuse_simplex = env_int("NEXUS_VSCAN_REFUSE_SIMPLEX", 0);
     e_ignore_simplex = env_int("NEXUS_VSCAN_IGNORE_SIMPLEX", 0);
     e_no_duplex = env_int("NEXUS_VSCAN_NO_DUPLEX", 0);
@@ -868,6 +869,7 @@ static uint16_t cap_set(TW_CAPABILITY *cap)
         for (int i = 0; i < SIZES_N; i++) if (SIZES[i] == v) ok = 1;
         if (!ok) { g_cc = TWCC_BADVALUE; return TWRC_FAILURE; }
         c_size = (int)v;
+        if (c_feeder && e_paper_sets_duplex && !e_no_duplex) c_duplex = 1;
         c_frame_w = c_frame_h = 0;
         break;
     }

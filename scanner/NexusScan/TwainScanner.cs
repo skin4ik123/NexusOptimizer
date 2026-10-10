@@ -173,6 +173,9 @@ namespace NexusScan
                 SetPaper();
                 _session.SetOne(Tw.CAP_XFERCOUNT, Tw.TY_INT16, 0xFFFF);  // -1: everything in the feeder
                 _session.SetOne(Tw.CAP_INDICATORS, Tw.TY_BOOL, 0);       // no driver progress popups
+                // Paper size and other capabilities may restore a source's
+                // saved mode too. Confirm simplex after all settings are applied.
+                if (!_req.Duplex) SetSimplex();
             }
             else
             {

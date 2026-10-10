@@ -374,9 +374,10 @@ def test_virtual_twain_simplex_overrides_persisted_duplex():
     for arch in (32, 64):
         for transfer in ("native", "memory"):
             with Env(NEXUS_VSCAN_PAGES=3, NEXUS_VSCAN_DELAY_MS=1,
-                     NEXUS_VSCAN_INITIAL_DUPLEX=1, NEXUS_VSCAN_FEEDER_SETS_DUPLEX=1):
+                     NEXUS_VSCAN_INITIAL_DUPLEX=1, NEXUS_VSCAN_FEEDER_SETS_DUPLEX=1,
+                     NEXUS_VSCAN_PAPER_SETS_DUPLEX=1):
                 events, _ = run_job(device("twain", arch, VIRTUAL),
-                                    {"dpi": 75, "source": "feeder", "transfer": transfer})
+                                    {"dpi": 75, "source": "feeder", "transfer": transfer, "paper": "a4"})
             assert not errors_of(events) and len(pages_of(events)) == 3, (arch, transfer, events)
             settings = next(e for e in events if e.get("event") == "settings")
             assert settings["feeder"] is True and settings["duplex"] is False, settings

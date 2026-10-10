@@ -58,6 +58,42 @@ jobs:
           $python = '.venv/Scripts/python.exe'
           & $python -c "import importlib.metadata as m; print({n:m.version(n) for n in ['pymupdf','pikepdf','pillow','pyinstaller']})"
           Get-FileHash $setup[0].FullName -Algorithm SHA256 | Format-List
+      - name: Install, launch and remove the delivered application
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem artifacts/NexusOptimizer-Setup-*.exe).FullName
+          $installed = Join-Path $env:RUNNER_TEMP 'nexus-optimizer-installed'
+          $process = Start-Process $setup -ArgumentList @('/S','/nodesktop','/nomenu',"/dir=$installed") -PassThru -Wait
+          if ($process.ExitCode -notin 0, 3010) { throw "Setup failed: $($process.ExitCode)" }
+          if (-not (Test-Path "$installed/NexusOptimizer.exe")) { throw 'Installed executable missing' }
+          foreach ($arch in 32, 64) {
+            $lines = & "$installed/_internal/scan/NexusScan$arch.exe" layout | Out-String
+            if ($LASTEXITCODE -ne 0 -or $lines -notmatch '"layout","ok":true') { throw "Installed worker $arch failed" }
+          }
+          $app = Start-Process "$installed/NexusOptimizer.exe" -PassThru
+          try {
+            for ($i = 0; $i -lt 100; $i++) {
+              Start-Sleep -Milliseconds 200
+              $app.Refresh()
+              if ($app.HasExited) { throw "Installed app exited: $($app.ExitCode)" }
+              if ($app.MainWindowTitle -like 'Nexus Optimizer*') { break }
+            }
+            if ($app.MainWindowTitle -notlike 'Nexus Optimizer*') { throw 'Installed main window did not open' }
+            Write-Host "Installed app opened: $($app.MainWindowTitle)"
+            $null = $app.CloseMainWindow()
+            if (-not $app.WaitForExit(15000)) { throw 'Installed app did not close normally' }
+          } finally {
+            if (-not $app.HasExited) { $app.Kill() }
+          }
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.OpenDatabase((Resolve-Path artifacts/NexusOptimizer.msi).Path, 0)
+          $view = $database.OpenView("SELECT Value FROM Property WHERE Property = 'ProductCode'")
+          $view.Execute()
+          $product = $view.Fetch().StringData(1)
+          $remove = Start-Process msiexec.exe -ArgumentList @('/x',$product,'/qn','/norestart') -PassThru -Wait
+          if ($remove.ExitCode -notin 0, 3010) { throw "Uninstall failed: $($remove.ExitCode)" }
+          if (Test-Path "$installed/NexusOptimizer.exe") { throw 'Executable remained after uninstall' }
+          Write-Host 'Installer, installed GUI, both scanner workers and uninstall verified'
       - name: Upload the single installer
         uses: actions/upload-artifact@v4
         with:
