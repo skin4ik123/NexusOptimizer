@@ -48,10 +48,10 @@ just as much as money.
 
 | Feature | Details |
 | --- | --- |
-| **PDF compression** | A "smart" profile reads the document and picks its own settings. Scans, text documents and mixed files are treated differently, and the structure survives. |
+| **PDF compression** | A "smart" profile reads the document and picks its own settings. Every image is decided on its own: scans are brought down to the target density by the real placement on the page and encoded at a decent quality, JPEGs already at the target are left alone, 1-bit and transparent images are never touched. The OCR text layer, bookmarks, links and forms survive. |
 | **Photos** | Batch resize and recompress, JPEG/PNG/WebP, HEIC and AVIF from phones, ICC profiles kept, EXIF orientation applied. |
 | **Video** | H.264, H.265, AV1 and VP9 with GPU encoding — Intel QSV, NVENC, AMF or Media Foundation, detected automatically and falling back to the processor. |
-| **Scan to PDF** | WIA and TWAIN, the driver's own window, several pages collected into one file, with the real physical page size. |
+| **Scanning** | WIA and TWAIN, including the 32-bit TWAIN drivers most office MFPs install. Flatbed, document feeder and two-sided scanning with the program's own settings or in the driver's window. Pages appear as they are scanned; skewed pages are straightened, blank backs skipped; pages can be rotated, reordered and survive closing the program. A crashing driver cannot take the program down. |
 | **Explorer menu** | "Compress with Nexus Optimizer" on files and folders, plus a "Send to" shortcut that keeps working on Windows 11 24H2. |
 | **Originals preserved** | No code path deletes a source file before the result is confirmed written. |
 | **Folders, not just files** | Drop a folder, optionally recurse, choose where results go and how they are named. |
@@ -81,7 +81,8 @@ contains file contents.
 - Windows 10 version 21H2 or Windows 11, 64-bit
 - About 700 MB of free disk space
 - 4 GB of memory; 8 GB is more comfortable for video
-- No Python installation needed — the runtime is included
+- Nothing to download first: the program carries its own Python and Visual C++
+  runtime, and the installer runs on the .NET Framework that is part of Windows
 - No internet connection required, during install or afterwards
 
 ## Installing
@@ -93,21 +94,23 @@ user by default and needs no administrator rights.
 Silent install:
 
 ```powershell
-NexusOptimizer-Setup-3.7.0.exe /S
-NexusOptimizer-Setup-3.7.0.exe /S /allusers /nodesktop
-NexusOptimizer-Setup-3.7.0.exe /S /dir="C:\Apps\Nexus Optimizer" /nomenu
+NexusOptimizer-Setup-3.9.0.exe /S
+NexusOptimizer-Setup-3.9.0.exe /S /allusers /nodesktop
+NexusOptimizer-Setup-3.9.0.exe /S /dir="C:\Apps\Nexus Optimizer" /nomenu
 ```
 
 ## Building from source
 
 Requires Windows, Python 3.11+, the [.NET 10 SDK](https://dotnet.microsoft.com/download)
-and [WiX 5](https://wixtoolset.org/) (`dotnet tool install --global wix`).
+(it also builds the .NET Framework 4.6.2 installer and scanner worker) and
+[WiX 5](https://wixtoolset.org/) (`dotnet tool install --global wix`).
 
 ```powershell
 ./build_installer.ps1
 ```
 
-This creates the virtual environment, builds the application with PyInstaller,
+This creates the virtual environment, builds the scanner worker and the
+application with PyInstaller,
 runs the tests, packages the MSI and produces the branded installer in
 `artifacts/`. The version comes from `APP_VERSION` in `NexusPDFOptimizer.py` and
 from nowhere else.
@@ -136,16 +139,25 @@ same terms.
 Third-party components and their licences:
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## TWAIN
+## Scanning
 
-TWAIN support is a first-party `ctypes` binding to `twaindsm.dll`, written
-against the public TWAIN specification. Earlier versions used the `pytwain`
-package, which is GPL-2.0-only and therefore incompatible with both AGPL-3.0
-(PyMuPDF) and GPL-3.0 (FFmpeg) — shipping them together was not permitted.
+Scanning runs in a separate worker, `NexusScan64.exe` and `NexusScan32.exe`
+(`scanner/NexusScan`, C# on .NET Framework 4.6.2, which is part of Windows):
 
-The 64-bit TWAIN Data Source Manager is bundled because Windows does not include
-one and not every scanner driver installs it; its provenance and checksums are
-recorded in [twaindsm.README.md](twaindsm.README.md).
+- a process can load only TWAIN drivers of its own bitness, and most office
+  MFPs still install 32-bit ones — the 32-bit worker reaches them;
+- WIA runs on the worker's single-threaded COM apartment, as it must;
+- a driver that crashes or hangs takes the worker down, never the program or
+  the pages already scanned.
+
+TWAIN and WIA are first-party code written against the public specifications.
+Earlier versions used the `pytwain` package, which is GPL-2.0-only and
+therefore incompatible with both AGPL-3.0 (PyMuPDF) and GPL-3.0 (FFmpeg).
+
+The TWAIN Data Source Manager is bundled in both bitnesses; provenance and
+checksums are in [scanner/twain/README.md](scanner/twain/README.md). For
+testing without a scanner there is a virtual one:
+[tools/virtual-scanner](tools/virtual-scanner/README.md).
 
 ## Known limitations
 
@@ -153,8 +165,9 @@ recorded in [twaindsm.README.md](twaindsm.README.md).
   checksum is published with every release.
 - Video encoding on a machine without a supported GPU falls back to the
   processor and is correspondingly slower.
-- The TWAIN path is exercised against the real Data Source Manager, but the full
-  scan cycle depends on the scanner's own driver.
+- Scanning is tested end to end against the virtual scanner (TWAIN, both
+  bitnesses) and a simulated WIA device. Real drivers differ in what they
+  support; the program falls back to the nearest setting and says so.
 
 ---
 

@@ -84,6 +84,14 @@
       <Directory Id="NexusDataDir" Name="NexusOptimizer"/>
     </StandardDirectory>
 
+    <!-- Scanned pages waiting to be saved live in the local (not roaming)
+         profile: they can be large and must not travel with a roaming profile. -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="NexusLocalDir" Name="NexusOptimizer">
+        <Directory Id="NexusScanSessionDir" Name="ScanSession"/>
+      </Directory>
+    </StandardDirectory>
+
     <ComponentGroup Id="DataCleanup">
       <!-- NOT UPGRADINGPRODUCTCODE is required: an upgrade removes the previous
            version the same way, and without it every upgrade would wipe the
@@ -95,6 +103,15 @@
                        Type="integer" Value="1" KeyPath="yes"/>
         <RemoveFile Id="RemoveDataFiles" Name="*" On="uninstall"/>
         <RemoveFolder Id="RemoveDataDir" On="uninstall"/>
+      </Component>
+      <Component Id="ScanSessionCleanupComponent" Directory="NexusScanSessionDir"
+                 Guid="0B7E5D21-94C3-4F6A-8D12-3E9A6C4F1B57"
+                 Condition="NOT UPGRADINGPRODUCTCODE">
+        <RegistryValue Root="HKCU" Key="Software\NexusOptimizer" Name="scanSessionCleanup"
+                       Type="integer" Value="1" KeyPath="yes"/>
+        <RemoveFile Id="RemoveScanPages" Name="*" On="uninstall"/>
+        <RemoveFolder Id="RemoveScanSessionDir" On="uninstall"/>
+        <RemoveFolder Id="RemoveLocalDir" Directory="NexusLocalDir" On="uninstall"/>
       </Component>
     </ComponentGroup>
 

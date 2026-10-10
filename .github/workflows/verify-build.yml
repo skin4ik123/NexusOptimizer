@@ -1,0 +1,78 @@
+name: Verify and build Nexus Optimizer
+on:
+  push:
+    branches: [codex/nexusoptimizer-039-fixes]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: '1'
+      PYTHONUNBUFFERED: '1'
+      NEXUS_MULTI: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed' }
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX UI extension failed' }
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX Util extension failed' }
+      - name: Build and install the virtual TWAIN test device
+        shell: pwsh
+        run: |
+          & powershell -NoProfile -ExecutionPolicy Bypass -File tools/virtual-scanner/build.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Virtual scanner build failed' }
+          & powershell -NoProfile -ExecutionPolicy Bypass -File tools/virtual-scanner/install.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Virtual scanner installation failed' }
+      - name: Build application, execute PDF and scanner tests, package installer
+        shell: pwsh
+        run: |
+          & ./build_installer.ps1 2>&1 | Tee-Object -FilePath build-verification.log
+          if ($LASTEXITCODE -ne 0) { throw 'Verification or packaging failed' }
+          $log = Get-Content build-verification.log -Raw
+          if ($log -match 'SKIP test_') { throw 'Scanner tests were skipped' }
+      - name: Verify packaged scanner workers and installer payload
+        shell: pwsh
+        run: |
+          $setup = @(Get-ChildItem artifacts/NexusOptimizer-Setup-*.exe)
+          if ($setup.Count -ne 1 -or $setup[0].Length -lt 1000000) { throw 'Missing installer payload' }
+          foreach ($arch in 32, 64) {
+            $path = "dist/NexusOptimizer/_internal/scan/NexusScan$arch.exe"
+            $lines = & $path layout | Out-String
+            if ($LASTEXITCODE -ne 0 -or $lines -notmatch '"layout","ok":true') { throw "Packaged worker $arch failed: $lines" }
+          }
+          $python = '.venv/Scripts/python.exe'
+          & $python -c "import importlib.metadata as m; print({n:m.version(n) for n in ['pymupdf','pikepdf','pillow','pyinstaller']})"
+          Get-FileHash $setup[0].FullName -Algorithm SHA256 | Format-List
+      - name: Upload the single installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexusOptimizer-Setup
+          path: artifacts/NexusOptimizer-Setup-*.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+      - name: Upload verification log and checksums
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexusoptimizer-verification
+          path: |
+            build-verification.log
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: warn
+          retention-days: 30

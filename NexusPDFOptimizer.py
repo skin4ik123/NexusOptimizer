@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import sys
+import io
 import json
 import time
 import re
@@ -37,6 +38,7 @@ import tempfile
 import shutil
 import subprocess
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -45,7 +47,7 @@ from typing import List, Tuple, Optional
 from datetime import datetime, timedelta
 
 APP_NAME = "Nexus Optimizer"
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.9.1"
 APP_AUTHOR = "Artur Yurchuk"
 APP_CREDIT = f"Crafted by {APP_AUTHOR}"
 
@@ -272,7 +274,11 @@ def _make_sendto_shortcut() -> bool:
         pass
     try:
         import comtypes.client as cc
-        ws = cc.CreateObject("WScript.Shell")
+        # dynamic=True: позднее связывание. Без него comtypes генерирует
+        # обёртки библиотеки типов, а в собранной программе писать их некуда —
+        # приходил «голый» IDispatch без .Save, и каждый раз срабатывал
+        # запасной PowerShell (на офисных ПК его часто запрещают политики).
+        ws = cc.CreateObject("WScript.Shell", dynamic=True)
         sc = ws.CreateShortcut(str(lnk))
         sc.TargetPath = exe
         if args:
@@ -899,16 +905,81 @@ TRANSLATIONS = {
         "history_empty": "История пуста",
         "history_open": "Открыть папку",
         "history_clear": "Очистить историю",
+        "scan_kind_twain32": "TWAIN 32-бит",
+        "scan_settings": "Параметры сканирования",
+        "scan_use_ui": "Настраивать в окне сканера",
+        "scan_hint_ui": "Разрешение, цвет и подачу бумаги выберите\nв окне сканера — оно откроется по кнопке",
+        "scan_source": "Подача",
+        "scan_src_flatbed": "Стекло (планшет)",
+        "scan_src_feeder": "Автоподатчик",
+        "scan_src_duplex": "Податчик, 2 стороны",
+        "scan_color": "Цвет",
+        "scan_col_color": "Цветной",
+        "scan_col_gray": "Оттенки серого",
+        "scan_col_bw": "Чёрно-белый",
+        "scan_dpi": "Разрешение",
+        "scan_paper": "Формат",
+        "scan_pap_auto": "Вся область сканера",
+        "scan_after": "После сканирования",
+        "scan_deskew": "Выравнивать перекошенные страницы",
+        "scan_skip_blank": "Пропускать пустые листы (автоподатчик)",
+        "scan_select_all": "Выбрать все",
+        "scan_help": "1) Выберите сканер и параметры слева\n2) «Сканировать» — страницы появляются по мере сканирования\n3) Щелчок выбирает страницу, перетаскивание меняет порядок, ↺ ↻ поворачивают\n4) Сохраните одним PDF или картинками JPG. Страницы не пропадут до «Очистить список»",
+        "scan_searching": "Поиск сканеров…",
+        "scan_found": "Найдено сканеров: {n}",
+        "scan_no_devices": "Сканеры не найдены. Включите сканер, проверьте кабель или сеть и нажмите «Обновить список».",
+        "scan_pick_device": "Выберите сканер в списке слева",
+        "scan_cancel": "Остановить",
+        "scan_st_opening": "Подключение к сканеру…",
+        "scan_st_waiting_ui": "Открыто окно сканера…",
+        "scan_st_scanning": "Сканирование… получено изображений: {n}",
+        "scan_st_scanning0": "Сканирование…",
+        "scan_page_n": "страница {n}",
+        "scan_done_n": "Отсканировано страниц: {n}",
+        "scan_blank_n": "пустых пропущено: {n}",
+        "scan_straight_n": "выровнено: {n}",
+        "scan_kept_n": "Уже полученные страницы сохранены: {n}",
+        "scan_cancelled": "Сканирование остановлено",
+        "scan_blank_skipped": "пустой лист пропущен",
+        "scan_no_pages_came": "Сканер не прислал ни одной страницы",
+        "scan_restored": "Страницы с прошлого раза на месте: {n}",
+        "select_pages_first": "Сначала выберите страницы — щелчком по ним",
+        "scan_warn_ui_required": "Этот сканер работает только через своё окно — оно открыто.",
+        "scan_warn_no_duplex": "Сканер не умеет сканировать обе стороны — отсканирована одна.",
+        "scan_warn_color_substituted": "Сканер не поддерживает выбранный цвет — программа привела страницы к нему сама.",
+        "scan_warn_resolution_refused": "Сканер не принял разрешение — использовано {dpi} dpi.",
+        "scan_err_helpers_missing": "Компонент сканирования не найден. Переустановите программу.",
+        "scan_err_dsm_missing": "Не найден менеджер TWAIN. Переустановите программу.",
+        "scan_err_no_device": "Сканер не найден. Проверьте, что он включён и подключён, и обновите список.",
+        "scan_err_device_busy": "Сканер занят другой программой или другим пользователем. Закройте её и повторите.",
+        "scan_err_device_offline": "Сканер не отвечает. Проверьте питание и кабель (или сеть).",
+        "scan_err_device_open_failed": "Не удалось подключиться к сканеру. Проверьте, что он включён, или переустановите его драйвер.",
+        "scan_err_paper_jam": "Замятие бумаги. Извлеките лист и нажмите «Сканировать» ещё раз.",
+        "scan_err_double_feed": "Податчик захватил несколько листов сразу. Разложите стопку и повторите.",
+        "scan_err_feeder_empty": "В автоподатчике нет бумаги.",
+        "scan_err_no_feeder": "У этого сканера нет автоподатчика — выберите подачу «Стекло».",
+        "scan_err_simplex_refused": "Драйвер не отключил сканирование двух сторон. Сканирование остановлено; проверьте настройки драйвера Epson.",
+        "scan_err_cover_open": "Открыта крышка сканера.",
+        "scan_err_warming_up": "Сканер прогревается — повторите через минуту.",
+        "scan_err_paper_problem": "Проблема с бумагой в податчике — проверьте лоток.",
+        "scan_err_user_intervention": "Сканер просит внимания — проверьте его панель.",
+        "scan_err_communication": "Связь со сканером прервалась. Проверьте кабель или сеть.",
+        "scan_err_bad_setting": "Сканер не принял эти параметры — попробуйте другое разрешение или цвет.",
+        "scan_err_access_denied": "Нет доступа к сканеру.",
+        "scan_err_wia_unavailable": "Служба Windows для сканеров (WIA) недоступна на этом компьютере.",
+        "scan_err_wia_service": "Не запущена служба «Служба загрузки изображений Windows (WIA)». Включите её в «Службах» Windows.",
+        "scan_err_out_of_memory": "Не хватило памяти для страницы — уменьшите разрешение.",
+        "scan_err_driver_error": "Драйвер сканера сообщил об ошибке.",
+        "scan_err_driver_crashed": "Драйвер сканера аварийно завершился. Программа продолжает работу.",
+        "scan_err_timeout": "Сканер перестал отвечать — сканирование остановлено.",
+        "scan_err_internal": "Ошибка сканирования — подробности в журнале программы.",
         "scan_pages": "Отсканированные страницы",
-        "scan_btn": "Сканировать…",
+        "scan_btn": "Сканировать",
         "save_pdf": "Сохранить PDF",
         "save_jpg": "Сохранить JPG",
-        "save_files": "Сохранить по файлам",
         "compress_doc": "Сжимать документ",
         "folder": "Папка сохранения",
         "refresh_dev": "Обновить список",
-        "scan_hint": "Настройки DPI, цвета и качества —\nв окне драйвера сканера",
-        "del_temp": "Удалить временные файлы",
         "remove_sel": "Убрать выбранные",
         "clear_list": "Очистить список",
         "comp_settings": "Сжатие при сохранении",
@@ -958,9 +1029,7 @@ TRANSLATIONS = {
         "pdf_created": "PDF создан:",
         "ffmpeg_missing": "FFmpeg не найден.\n\nПересоберите приложение с imageio-ffmpeg\nили скачайте https://www.gyan.dev/ffmpeg/builds/\nи добавьте bin в PATH.",
         "no_pages": "Нет страниц.",
-        "no_pages_scan": "Нет страниц. Нажмите «Сканировать…».",
-        "win_dialog": "Системный диалог Windows…",
-        "scanning": "Окно сканера...",
+        "no_pages_scan": "Нет страниц. Нажмите «Сканировать».",
         "aggressive_scans": "Агрессивный (сканы)",
         "max_compression": "Максимальное сжатие",
         "high_quality": "Высокое качество",
@@ -984,14 +1053,16 @@ TRANSLATIONS = {
         "err_no_space": "Мало места на диске",
         "err_no_ffmpeg": "FFmpeg не найден",
         "err_protected": "PDF защищён паролем — сжатие невозможно",
+        "err_same_file": "Исходный файл и результат должны иметь разные имена.",
         "err_no_gain": "Почти без выигрыша — оригинал не тронут",
+        "err_bad_result": "Результат не прошёл проверку — оригинал не тронут",
         "err_no_access": "Нет доступа к файлу",
         "err_pymupdf": "Нужен PyMuPDF",
         "err_no_write": "Нет прав на запись в папку",
         "err_dir": "Папка недоступна",
         "err_add_pdf": "Не удалось добавить PDF",
         "err_add_pages": "Не удалось добавить ни одной страницы",
-        "single_pdf_note": "один файл → параллель по страницам",
+        "single_pdf_note": "один файл → изображения обрабатываются параллельно",
         "encoding_one": "Кодирую: ",
         "run_parallel": "Параллельно: ",
         "no_avail_files": "Нет доступных файлов для обработки",
@@ -1024,7 +1095,7 @@ TRANSLATIONS = {
         "sort_added": "По добавлению",
         "sort_name": "По имени",
         "sort_size": "По размеру",
-        "empty_pages_hint": "Нажмите «Сканировать…» —\nстраницы появятся здесь",
+        "empty_pages_hint": "Нажмите «Сканировать» —\nстраницы появятся здесь\n\nили перетащите сюда картинки",
         "history_empty_hint": "Здесь появятся выполненные операции",
         # --- v3.2: строки-карточки, сводка, тосты ---
         "queued": "в очереди",
@@ -1077,16 +1148,81 @@ TRANSLATIONS = {
         "history_empty": "History is empty",
         "history_open": "Open folder",
         "history_clear": "Clear history",
+        "scan_kind_twain32": "TWAIN 32-bit",
+        "scan_settings": "Scan settings",
+        "scan_use_ui": "Set up in the scanner's window",
+        "scan_hint_ui": "Choose resolution, colour and paper source\nin the scanner's window — it opens on Scan",
+        "scan_source": "Source",
+        "scan_src_flatbed": "Glass (flatbed)",
+        "scan_src_feeder": "Document feeder",
+        "scan_src_duplex": "Feeder, both sides",
+        "scan_color": "Colour",
+        "scan_col_color": "Colour",
+        "scan_col_gray": "Greyscale",
+        "scan_col_bw": "Black and white",
+        "scan_dpi": "Resolution",
+        "scan_paper": "Paper",
+        "scan_pap_auto": "Whole scan area",
+        "scan_after": "After scanning",
+        "scan_deskew": "Straighten skewed pages",
+        "scan_skip_blank": "Skip blank sheets (feeder)",
+        "scan_select_all": "Select all",
+        "scan_help": "1) Pick a scanner and settings on the left\n2) Scan — pages appear as they are scanned\n3) Click selects a page, drag reorders, ↺ ↻ rotate\n4) Save as one PDF or as JPG images. Pages stay until Clear list",
+        "scan_searching": "Looking for scanners…",
+        "scan_found": "Scanners found: {n}",
+        "scan_no_devices": "No scanners found. Turn the scanner on, check the cable or network and click Refresh list.",
+        "scan_pick_device": "Pick a scanner in the list on the left",
+        "scan_cancel": "Stop",
+        "scan_st_opening": "Connecting to the scanner…",
+        "scan_st_waiting_ui": "The scanner's window is open…",
+        "scan_st_scanning": "Scanning… images received: {n}",
+        "scan_st_scanning0": "Scanning…",
+        "scan_page_n": "page {n}",
+        "scan_done_n": "Pages scanned: {n}",
+        "scan_blank_n": "blank skipped: {n}",
+        "scan_straight_n": "straightened: {n}",
+        "scan_kept_n": "Pages received so far are kept: {n}",
+        "scan_cancelled": "Scanning stopped",
+        "scan_blank_skipped": "blank sheet skipped",
+        "scan_no_pages_came": "The scanner sent no pages",
+        "scan_restored": "Pages from last time are still here: {n}",
+        "select_pages_first": "Select pages first — click on them",
+        "scan_warn_ui_required": "This scanner only works through its own window — it is open.",
+        "scan_warn_no_duplex": "The scanner cannot scan both sides — one side was scanned.",
+        "scan_warn_color_substituted": "The scanner does not offer the chosen colour mode — the pages were converted by the program.",
+        "scan_warn_resolution_refused": "The scanner refused the resolution — {dpi} dpi was used.",
+        "scan_err_helpers_missing": "The scanning component is missing. Reinstall the program.",
+        "scan_err_dsm_missing": "The TWAIN manager is missing. Reinstall the program.",
+        "scan_err_no_device": "Scanner not found. Check that it is on and connected, then refresh the list.",
+        "scan_err_device_busy": "The scanner is busy with another program or user. Close it and try again.",
+        "scan_err_device_offline": "The scanner does not respond. Check its power and cable (or network).",
+        "scan_err_device_open_failed": "Could not connect to the scanner. Check that it is on, or reinstall its driver.",
+        "scan_err_paper_jam": "Paper jam. Remove the sheet and click Scan again.",
+        "scan_err_double_feed": "The feeder took several sheets at once. Fan the stack and try again.",
+        "scan_err_feeder_empty": "The document feeder is empty.",
+        "scan_err_no_feeder": "This scanner has no document feeder — choose Glass as the source.",
+        "scan_err_simplex_refused": "The driver did not turn off duplex. Scanning was stopped; check the scanner driver settings.",
+        "scan_err_cover_open": "The scanner cover is open.",
+        "scan_err_warming_up": "The scanner is warming up — try again in a minute.",
+        "scan_err_paper_problem": "Paper problem in the feeder — check the tray.",
+        "scan_err_user_intervention": "The scanner needs attention — check its panel.",
+        "scan_err_communication": "The connection to the scanner was lost. Check the cable or network.",
+        "scan_err_bad_setting": "The scanner refused these settings — try another resolution or colour mode.",
+        "scan_err_access_denied": "Access to the scanner was denied.",
+        "scan_err_wia_unavailable": "The Windows scanner service (WIA) is not available on this computer.",
+        "scan_err_wia_service": "The Windows Image Acquisition (WIA) service is not running. Start it in Windows Services.",
+        "scan_err_out_of_memory": "Not enough memory for the page — lower the resolution.",
+        "scan_err_driver_error": "The scanner driver reported an error.",
+        "scan_err_driver_crashed": "The scanner driver crashed. The program keeps running.",
+        "scan_err_timeout": "The scanner stopped responding — scanning was stopped.",
+        "scan_err_internal": "Scanning failed — details are in the program log.",
         "scan_pages": "Scanned pages",
-        "scan_btn": "Scan…",
+        "scan_btn": "Scan",
         "save_pdf": "Save PDF",
         "save_jpg": "Save JPG",
-        "save_files": "Save as files",
         "compress_doc": "Compress document",
         "folder": "Output folder",
         "refresh_dev": "Refresh list",
-        "scan_hint": "DPI, color and quality are set\nin the scanner driver window",
-        "del_temp": "Delete temp files",
         "remove_sel": "Remove selected",
         "clear_list": "Clear list",
         "comp_settings": "Compression on save",
@@ -1136,9 +1272,7 @@ TRANSLATIONS = {
         "pdf_created": "PDF created:",
         "ffmpeg_missing": "FFmpeg not found.\n\nRebuild the app with imageio-ffmpeg\nor download https://www.gyan.dev/ffmpeg/builds/\nand add bin to PATH.",
         "no_pages": "No pages.",
-        "no_pages_scan": "No pages. Click Scan… first.",
-        "win_dialog": "Windows scanner dialog…",
-        "scanning": "Scanner window...",
+        "no_pages_scan": "No pages. Click Scan first.",
         "aggressive_scans": "Aggressive (scans)",
         "max_compression": "Maximum compression",
         "high_quality": "High quality",
@@ -1162,14 +1296,16 @@ TRANSLATIONS = {
         "err_no_space": "Not enough disk space",
         "err_no_ffmpeg": "FFmpeg not found",
         "err_protected": "PDF is password-protected",
+        "err_same_file": "The source and output must have different file names.",
         "err_no_gain": "No real gain — original kept",
+        "err_bad_result": "The result failed verification — original kept",
         "err_no_access": "Access denied",
         "err_pymupdf": "PyMuPDF is required",
         "err_no_write": "No write permission for the folder",
         "err_dir": "Folder unavailable",
         "err_add_pdf": "Could not add PDF",
         "err_add_pages": "Could not add any pages",
-        "single_pdf_note": "single file → parallel pages",
+        "single_pdf_note": "single file → images processed in parallel",
         "encoding_one": "Encoding: ",
         "run_parallel": "In parallel: ",
         "no_avail_files": "No processable files",
@@ -1202,7 +1338,7 @@ TRANSLATIONS = {
         "sort_added": "By added",
         "sort_name": "By name",
         "sort_size": "By size",
-        "empty_pages_hint": "Click Scan… —\npages will appear here",
+        "empty_pages_hint": "Click Scan —\npages will appear here\n\nor drop pictures here",
         "history_empty_hint": "Finished operations will appear here",
         # --- v3.2: file cards, summary, toasts ---
         "queued": "queued",
@@ -2354,586 +2490,651 @@ def _brace_parse(data: str) -> List[str]:
         paths = data.split()
     return paths
 
-# -------------------- SCANNER (WIA + TWAIN) --------------------
-# Maximum compatibility: the driver's own dialog plus a fallback chain.
-#
-# TWAIN goes through a first-party ctypes binding rather than the pytwain
-# package. The reason is legal: pytwain is distributed strictly under GPL-2.0
-# with no "or later", while this program is built with PyMuPDF under AGPL-3.0
-# and ships FFmpeg under GPL-3.0. GPL-2.0-only is incompatible with both, so
-# such a build could not be distributed at all. TWAIN itself is an open
-# specification, and an own implementation inherits nobody's terms.
+# -------------------- SCANNER --------------------
+# Scanning runs in a separate worker process: NexusScan64.exe or NexusScan32.exe
+# (scanner/NexusScan, .NET Framework 4.6.2, which is part of Windows 10/11).
+#  - Only a 32-bit process can load the 32-bit TWAIN drivers that most office
+#    MFPs still install; a 64-bit program cannot see them at all.
+#  - WIA runs on the worker's STA thread. The old in-process code called WIA
+#    from a plain thread without COM initialised: "CoInitialize has not been
+#    called", and the WIA device list was always empty.
+#  - A driver that crashes or hangs takes the worker down, never the program
+#    and the pages already scanned.
+# The worker reports JSON lines; pages arrive as BMP files and are turned into
+# final page files here (orientation, blank check, JPEG or 1-bit PNG).
 
-# ---------- TWAIN: first-party binding (ctypes) ----------
-# Implements exactly what the application needs: list the sources, open the
-# chosen one, set the resolution, show the driver window and take the image by
-# native transfer (a DIB in memory). TWAIN structures on Windows are packed to
-# two bytes — without _pack_ = 2 the fields shift and the driver reads rubbish.
-
-_TWRC_SUCCESS, _TWRC_FAILURE, _TWRC_CANCEL = 0, 1, 2
-_TWRC_NOTDSEVENT, _TWRC_XFERDONE, _TWRC_ENDOFLIST = 5, 6, 7
-
-_DG_CONTROL, _DG_IMAGE = 0x0001, 0x0002
-_DAT_CAPABILITY, _DAT_EVENT, _DAT_IDENTITY, _DAT_PARENT = 0x0001, 0x0002, 0x0003, 0x0004
-_DAT_PENDINGXFERS, _DAT_USERINTERFACE = 0x0005, 0x0009
-_DAT_IMAGENATIVEXFER = 0x0104
-
-_MSG_GET, _MSG_SET, _MSG_RESET = 0x0001, 0x0006, 0x0007
-_MSG_GETFIRST, _MSG_GETNEXT = 0x0004, 0x0005
-_MSG_OPENDSM, _MSG_CLOSEDSM = 0x0301, 0x0302
-_MSG_OPENDS, _MSG_CLOSEDS = 0x0401, 0x0402
-_MSG_ENABLEDS, _MSG_DISABLEDS = 0x0501, 0x0502
-_MSG_PROCESSEVENT = 0x0601
-_MSG_ENDXFER = 0x0701
-_MSG_XFERREADY, _MSG_CLOSEDSREQ, _MSG_CLOSEDSOK = 0x0101, 0x0102, 0x0103
-
-_TWON_ONEVALUE = 0x0005
-_TWTY_UINT16, _TWTY_FIX32 = 0x0005, 0x0007
-_ICAP_UNITS, _ICAP_XRESOLUTION, _ICAP_YRESOLUTION = 0x0102, 0x1118, 0x1119
-_TWUN_INCHES = 0
-_DF_APP2 = 0x00000001  # SupportedGroups: приложение
+SCAN_SESSION_DIR = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+                    / "NexusOptimizer" / "ScanSession")
+SCAN_HELPER_LOG = APPDATA_DIR / "scanner.log"
+SCAN_DPIS = (150, 200, 300, 400, 600)
+SCAN_SOURCES = ("flatbed", "feeder", "duplex")
+SCAN_COLORS = ("color", "gray", "bw")
+SCAN_PAPERS = ("a4", "letter", "legal", "auto")
+SCAN_LIST_TIMEOUT = 30      # s: a driver that hangs while being listed
+SCAN_STALL_TIMEOUT = 240    # s without any sign of life while scanning
+SCAN_CANCEL_GRACE = 10      # s to stop politely before the worker is killed
+SCAN_BLANK_INK = 0.0002     # share of dark pixels below which a page is blank
 
 
-class _TwFix32(ctypes.Structure):
-    _pack_ = 2
-    _fields_ = [("Whole", ctypes.c_int16), ("Frac", ctypes.c_uint16)]
-
-
-class _TwVersion(ctypes.Structure):
-    _pack_ = 2
-    _fields_ = [("MajorNum", ctypes.c_uint16), ("MinorNum", ctypes.c_uint16),
-                ("Language", ctypes.c_uint16), ("Country", ctypes.c_uint16),
-                ("Info", ctypes.c_char * 34)]
-
-
-class _TwIdentity(ctypes.Structure):
-    _pack_ = 2
-    _fields_ = [("Id", ctypes.c_uint32), ("Version", _TwVersion),
-                ("ProtocolMajor", ctypes.c_uint16),
-                ("ProtocolMinor", ctypes.c_uint16),
-                ("SupportedGroups", ctypes.c_uint32),
-                ("Manufacturer", ctypes.c_char * 34),
-                ("ProductFamily", ctypes.c_char * 34),
-                ("ProductName", ctypes.c_char * 34)]
-
-
-class _TwUserInterface(ctypes.Structure):
-    _pack_ = 2
-    _fields_ = [("ShowUI", ctypes.c_uint16), ("ModalUI", ctypes.c_uint16),
-                ("hParent", ctypes.c_void_p)]
-
-
-class _TwEvent(ctypes.Structure):
-    _pack_ = 2
-    _fields_ = [("pEvent", ctypes.c_void_p), ("TWMessage", ctypes.c_uint16)]
-
-
-class _TwCapability(ctypes.Structure):
-    _pack_ = 2
-    _fields_ = [("Cap", ctypes.c_uint16), ("ConType", ctypes.c_uint16),
-                ("hContainer", ctypes.c_void_p)]
-
-
-class _TwOneValue(ctypes.Structure):
-    _pack_ = 2
-    _fields_ = [("ItemType", ctypes.c_uint32), ("Item", ctypes.c_uint32)]
-
-
-class _TwPendingXfers(ctypes.Structure):
-    _pack_ = 2
-    _fields_ = [("Count", ctypes.c_uint16), ("Reserved", ctypes.c_uint32)]
-
-
-class _WinMsg(ctypes.Structure):
-    _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint32),
-                ("wParam", ctypes.c_size_t), ("lParam", ctypes.c_ssize_t),
-                ("time", ctypes.c_uint32), ("pt_x", ctypes.c_long),
-                ("pt_y", ctypes.c_long)]
-
-
-_TWAIN_DSM = None
-_TWAIN_DSM_TRIED = False
-
-
-def _twain_dsm():
-    """The TWAIN Data Source Manager.
-
-    Looked for next to the program first, so a build can carry its own copy and
-    not depend on whether a scanner driver installed one; then through the
-    normal Windows search. The architecture must match the process: a 64-bit
-    application cannot load a 32-bit twaindsm.dll, which is the usual reason
-    for "TWAIN sees no scanners".
-    """
-    global _TWAIN_DSM, _TWAIN_DSM_TRIED
-    if _TWAIN_DSM_TRIED:
-        return _TWAIN_DSM
-    _TWAIN_DSM_TRIED = True
-    here = Path(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(
-        sys.executable if is_frozen() else __file__))))
-    for cand in (str(here / "twaindsm.dll"), "twaindsm.dll"):
-        try:
-            _TWAIN_DSM = ctypes.WinDLL(cand)
-            log.info("TWAIN DSM: %s", cand)
-            return _TWAIN_DSM
-        except OSError:
-            continue
-    log.info("TWAIN DSM не найден (нужен twaindsm.dll той же разрядности)")
+def scan_helper_dir() -> Optional[Path]:
+    """The folder with NexusScan64.exe / NexusScan32.exe and their TWAIN
+    managers: inside the build, or scanner/out next to the sources."""
+    cands = []
+    env = os.environ.get("NEXUS_SCAN_HELPERS")
+    if env:
+        cands.append(Path(env))
+    if is_frozen():
+        cands.append(Path(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))) / "scan")
+        cands.append(Path(os.path.dirname(sys.executable)) / "scan")
+    cands.append(Path(os.path.dirname(os.path.abspath(__file__))) / "scanner" / "out")
+    for c in cands:
+        if (c / "NexusScan64.exe").is_file():
+            return c
     return None
 
 
-def _twain_app_identity() -> _TwIdentity:
-    ident = _TwIdentity()
-    ident.Id = 0
-    ident.Version.MajorNum = 3
-    ident.Version.MinorNum = 7
-    ident.Version.Language = 0  # TWLG_USA
-    ident.Version.Country = 1   # TWCY_USA
-    ident.Version.Info = APP_VERSION.encode("ascii", "replace")[:33]
-    # Declare TWAIN 1.9: containers can then be prepared with plain
-    # GlobalAlloc, without exchanging the DAT_ENTRYPOINT function table.
-    ident.ProtocolMajor = 1
-    ident.ProtocolMinor = 9
-    ident.SupportedGroups = _DG_CONTROL | _DG_IMAGE | _DF_APP2
-    ident.Manufacturer = APP_AUTHOR.encode("ascii", "replace")[:33]
-    ident.ProductFamily = b"Nexus"
-    ident.ProductName = b"Nexus Optimizer"
-    return ident
+class ScanDevice:
+    """A scanner as one of the workers sees it."""
+
+    def __init__(self, ev: dict):
+        self.backend = str(ev.get("backend") or "twain")
+        self.arch = int(ev.get("arch") or 64)
+        self.name = str(ev.get("name") or "").strip() or "Scanner"
+        self.manufacturer = str(ev.get("manufacturer") or "").strip()
+        self.family = str(ev.get("family") or "").strip()
+        # what the worker needs to find the device again
+        self.device = str(ev.get("id") or ev.get("name") or "")
+        self.key = f"{self.backend}{self.arch}:{self.device}"
+
+    @property
+    def kind(self) -> str:
+        if self.backend == "wia":
+            return "WIA"
+        return "TWAIN" if self.arch == 64 else t("scan_kind_twain32")
+
+    @property
+    def label(self) -> str:
+        return f"{self.name}  ·  {self.kind}"
+
+    def __repr__(self):
+        return f"ScanDevice({self.key!r})"
 
 
-def _twain_call(dsm, origin, dest, dg, dat, msg, data):
-    return dsm.DSM_Entry(ctypes.byref(origin),
-                         ctypes.byref(dest) if dest is not None else None,
-                         ctypes.c_uint32(dg), ctypes.c_uint16(dat),
-                         ctypes.c_uint16(msg), data)
+def _helper_exe(helpers: Path, arch: int) -> Path:
+    return helpers / ("NexusScan64.exe" if arch == 64 else "NexusScan32.exe")
 
 
-def twain_source_names() -> list:
-    """Names of the installed TWAIN sources. An empty list is not an error."""
-    dsm = _twain_dsm()
-    if dsm is None:
-        return []
-    app = _twain_app_identity()
-    names = []
-    if _twain_call(dsm, app, None, _DG_CONTROL, _DAT_PARENT, _MSG_OPENDSM,
-                   ctypes.byref(ctypes.c_void_p(None))) != _TWRC_SUCCESS:
-        log.warning("TWAIN: DSM не открылся")
-        return []
+def _run_helper(args: list, timeout: float) -> List[dict]:
+    """Runs a worker command to the end; a hung driver is killed by timeout."""
+    events: List[dict] = []
     try:
-        src = _TwIdentity()
-        rc = _twain_call(dsm, app, None, _DG_CONTROL, _DAT_IDENTITY,
-                         _MSG_GETFIRST, ctypes.byref(src))
-        while rc == _TWRC_SUCCESS:
-            names.append(src.ProductName.decode("mbcs", "replace").strip())
-            src = _TwIdentity()
-            rc = _twain_call(dsm, app, None, _DG_CONTROL, _DAT_IDENTITY,
-                             _MSG_GETNEXT, ctypes.byref(src))
-        if rc not in (_TWRC_ENDOFLIST, _TWRC_SUCCESS):
-            log.info("TWAIN: перечисление источников вернуло %s", rc)
-    finally:
-        _twain_call(dsm, app, None, _DG_CONTROL, _DAT_PARENT, _MSG_CLOSEDSM,
-                    ctypes.byref(ctypes.c_void_p(None)))
-    return names
-
-
-def _twain_set_fix32(dsm, app, src, cap_id: int, value: float) -> bool:
-    """One numeric capability of the source (X or Y resolution)."""
-    k32 = ctypes.windll.kernel32
-    whole = int(value)
-    frac = int(round((value - whole) * 65536.0)) & 0xFFFF
-    one = _TwOneValue(_TWTY_FIX32, (frac << 16) | (whole & 0xFFFF))
-    h = k32.GlobalAlloc(0x0042, ctypes.sizeof(one))  # GHND
-    if not h:
-        return False
+        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, creationflags=CNW,
+                                startupinfo=_startupinfo(), cwd=os.path.dirname(args[0]))
+    except OSError as e:
+        return [{"event": "note", "code": "helpers_missing", "detail": str(e)}]
+    _register_proc(proc)
     try:
-        p = k32.GlobalLock(ctypes.c_void_p(h))
-        ctypes.memmove(p, ctypes.byref(one), ctypes.sizeof(one))
-        k32.GlobalUnlock(ctypes.c_void_p(h))
-        cap = _TwCapability(cap_id, _TWON_ONEVALUE, h)
-        rc = _twain_call(dsm, app, src, _DG_CONTROL, _DAT_CAPABILITY,
-                         _MSG_SET, ctypes.byref(cap))
-        return rc == _TWRC_SUCCESS
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+        events.append({"event": "note", "code": "timeout",
+                       "detail": f"{os.path.basename(args[0])} {args[1]}"})
     finally:
-        k32.GlobalFree(ctypes.c_void_p(h))
-
-
-def _twain_set_uint16(dsm, app, src, cap_id: int, value: int) -> bool:
-    k32 = ctypes.windll.kernel32
-    one = _TwOneValue(_TWTY_UINT16, value & 0xFFFF)
-    h = k32.GlobalAlloc(0x0042, ctypes.sizeof(one))
-    if not h:
-        return False
-    try:
-        p = k32.GlobalLock(ctypes.c_void_p(h))
-        ctypes.memmove(p, ctypes.byref(one), ctypes.sizeof(one))
-        k32.GlobalUnlock(ctypes.c_void_p(h))
-        cap = _TwCapability(cap_id, _TWON_ONEVALUE, h)
-        return _twain_call(dsm, app, src, _DG_CONTROL, _DAT_CAPABILITY,
-                           _MSG_SET, ctypes.byref(cap)) == _TWRC_SUCCESS
-    finally:
-        k32.GlobalFree(ctypes.c_void_p(h))
-
-
-def _dib_handle_to_bmp(handle, bmp_path: str) -> bool:
-    """An in-memory DIB to a BMP file.
-
-    The driver hands over only the DIB body, without a file header: we add one
-    ourselves, otherwise no viewer opens the image.
-    """
-    k32 = ctypes.windll.kernel32
-    size = int(k32.GlobalSize(ctypes.c_void_p(handle)))
-    if size <= 40:
-        return False
-    p = k32.GlobalLock(ctypes.c_void_p(handle))
-    if not p:
-        return False
-    try:
-        raw = ctypes.string_at(p, size)
-    finally:
-        k32.GlobalUnlock(ctypes.c_void_p(handle))
-
-    header_size = int.from_bytes(raw[0:4], "little")
-    bit_count = int.from_bytes(raw[14:16], "little")
-    compression = int.from_bytes(raw[16:20], "little")
-    clr_used = int.from_bytes(raw[32:36], "little")
-    palette = clr_used * 4 if clr_used else ((1 << bit_count) * 4 if bit_count <= 8 else 0)
-    if compression == 3 and header_size == 40:  # BI_BITFIELDS: три маски
-        palette += 12
-    offset = 14 + header_size + palette
-
-    with open(bmp_path, "wb") as fh:
-        fh.write(b"BM")
-        fh.write((14 + size).to_bytes(4, "little"))
-        fh.write(b"\0\0\0\0")
-        fh.write(offset.to_bytes(4, "little"))
-        fh.write(raw)
-    return os.path.getsize(bmp_path) > 60
-
-
-def _twain_pump(dsm, app, src, on_ready, deadline: float) -> str:
-    """Message loop for as long as the driver window is up.
-
-    TWAIN 1.x requires the application to hand every window message to the
-    source: that is how the driver learns about clicks in its own window and
-    reports that an image is ready.
-    """
-    u32 = ctypes.windll.user32
-    msg = _WinMsg()
-    while time.time() < deadline:
-        if not u32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):  # PM_REMOVE
-            time.sleep(0.01)
+        _unregister_proc(proc)
+    for line in (out or b"").splitlines():
+        try:
+            events.append(json.loads(line.decode("utf-8", "replace")))
+        except ValueError:
             continue
-        ev = _TwEvent(ctypes.cast(ctypes.byref(msg), ctypes.c_void_p), 0)
-        rc = _twain_call(dsm, app, src, _DG_CONTROL, _DAT_EVENT,
-                         _MSG_PROCESSEVENT, ctypes.byref(ev))
-        if rc == _TWRC_NOTDSEVENT:
-            u32.TranslateMessage(ctypes.byref(msg))
-            u32.DispatchMessageW(ctypes.byref(msg))
-        if ev.TWMessage == _MSG_XFERREADY:
-            return on_ready()
-        if ev.TWMessage in (_MSG_CLOSEDSREQ, _MSG_CLOSEDSOK):
-            return "cancel"
-    return "timeout"
+    return events
 
 
-def twain_scan_to_file(source_name: str, out_path: str,
-                       dpi: int = 200) -> Tuple[bool, str]:
-    """Scans with the chosen TWAIN source through its own driver window."""
-    dsm = _twain_dsm()
-    if dsm is None:
-        return False, "TWAIN: twaindsm.dll not found"
+def list_scanners() -> Tuple[List[ScanDevice], List[dict]]:
+    """All scanners the workers can reach: WIA, 64-bit and 32-bit TWAIN.
 
-    u32 = ctypes.windll.user32
-    app = _twain_app_identity()
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Both workers are asked at the same time. The duplicates Windows creates
+    are dropped: WIA devices re-exposed to 32-bit TWAIN as "WIA-..." sources,
+    and a TWAIN driver installed in both bitnesses (the 64-bit one is kept).
+    """
+    helpers = scan_helper_dir()
+    if helpers is None:
+        return [], [{"event": "note", "code": "helpers_missing"}]
+    results: dict = {}
 
-    if _twain_call(dsm, app, None, _DG_CONTROL, _DAT_PARENT, _MSG_OPENDSM,
-                   ctypes.byref(ctypes.c_void_p(None))) != _TWRC_SUCCESS:
-        return False, "TWAIN: DSM open failed"
+    def ask(arch, extra):
+        exe = _helper_exe(helpers, arch)
+        if not exe.is_file():
+            results[arch] = [{"event": "note", "code": "helpers_missing",
+                              "detail": str(exe)}]
+            return
+        results[arch] = _run_helper(
+            [str(exe), "list", "--log", str(SCAN_HELPER_LOG)] + extra,
+            SCAN_LIST_TIMEOUT)
 
-    # A hidden window of our own: scanning runs on a worker thread, and the
-    # driver window must belong to the same thread as the message loop.
-    hwnd = u32.CreateWindowExW(0, "STATIC", "Nexus TWAIN", 0, 0, 0, 0, 0,
-                               None, None, None, None)
-    src = None
-    enabled = False
-    result = (False, "TWAIN: no data")
+    threads = [threading.Thread(target=ask, args=(64, []), daemon=True),
+               threading.Thread(target=ask, args=(32, ["--skip-wia"]), daemon=True)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(SCAN_LIST_TIMEOUT + 5)
+    devices, notes = merge_scanner_events(results)
+    log.info("scanners: %s; notes: %s", [d.key for d in devices],
+             [n.get("code") for n in notes])
+    return devices, notes
+
+
+def merge_scanner_events(results: dict) -> Tuple[List[ScanDevice], List[dict]]:
+    """{arch: [worker events]} → (devices without duplicates, notes)."""
+    devices: List[ScanDevice] = []
+    notes: List[dict] = []
+    for arch in (64, 32):
+        for ev in results.get(arch, []):
+            if ev.get("event") == "device":
+                if ev.get("bridge"):
+                    continue
+                devices.append(ScanDevice(ev))
+            elif ev.get("event") in ("note", "error"):
+                notes.append(ev)
+    twain64 = {d.name.lower() for d in devices if d.backend == "twain" and d.arch == 64}
+    uniq, seen = [], set()
+    for d in devices:
+        if d.backend == "twain" and d.arch == 32 and d.name.lower() in twain64:
+            continue
+        if d.key in seen:
+            continue
+        seen.add(d.key)
+        uniq.append(d)
+    order = {"wia": 0, "twain": 1}
+    uniq.sort(key=lambda d: (order.get(d.backend, 2), -d.arch, d.name.lower()))
+    return uniq, notes
+
+
+def wia_service_running() -> Optional[bool]:
+    """State of the Windows Image Acquisition service (stisvc); None if unknown."""
     try:
-        src = _TwIdentity()
-        src.ProductName = source_name.encode("mbcs", "replace")[:33]
-        if _twain_call(dsm, app, None, _DG_CONTROL, _DAT_IDENTITY,
-                       _MSG_OPENDS, ctypes.byref(src)) != _TWRC_SUCCESS:
-            return False, "TWAIN: source open failed"
-
-        _twain_set_uint16(dsm, app, src, _ICAP_UNITS, _TWUN_INCHES)
-        _twain_set_fix32(dsm, app, src, _ICAP_XRESOLUTION, float(dpi))
-        _twain_set_fix32(dsm, app, src, _ICAP_YRESOLUTION, float(dpi))
-
-        ui = _TwUserInterface(1, 0, ctypes.c_void_p(hwnd))
-        if _twain_call(dsm, app, src, _DG_CONTROL, _DAT_USERINTERFACE,
-                       _MSG_ENABLEDS, ctypes.byref(ui)) != _TWRC_SUCCESS:
-            return False, "TWAIN: cannot show driver window"
-        enabled = True
-
-        def take_image():
-            handle = ctypes.c_void_p(None)
-            rc = _twain_call(dsm, app, src, _DG_IMAGE, _DAT_IMAGENATIVEXFER,
-                             _MSG_GET, ctypes.byref(handle))
-            if rc != _TWRC_XFERDONE or not handle.value:
-                return "failed"
-            bmp = os.path.splitext(out_path)[0] + ".bmp"
-            ok = False
+        adv = ctypes.windll.advapi32
+        scm = adv.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
+        if not scm:
+            return None
+        try:
+            svc = adv.OpenServiceW(scm, "stisvc", 0x0004)  # SERVICE_QUERY_STATUS
+            if not svc:
+                return None
             try:
-                ok = _dib_handle_to_bmp(handle.value, bmp)
+                status = (ctypes.c_uint32 * 7)()
+                if not adv.QueryServiceStatus(svc, status):
+                    return None
+                return status[1] == 4  # SERVICE_RUNNING
             finally:
-                ctypes.windll.kernel32.GlobalFree(handle)
-            # End the transfer and reset the queue: without this the source
-            # stays busy and the next scan never starts.
-            pend = _TwPendingXfers()
-            _twain_call(dsm, app, src, _DG_CONTROL, _DAT_PENDINGXFERS,
-                        _MSG_ENDXFER, ctypes.byref(pend))
-            if pend.Count != 0:
-                _twain_call(dsm, app, src, _DG_CONTROL, _DAT_PENDINGXFERS,
-                            _MSG_RESET, ctypes.byref(_TwPendingXfers()))
-            return "ok" if ok else "failed"
-
-        state = _twain_pump(dsm, app, src, take_image, time.time() + 600)
-        if state == "ok":
-            bmp = os.path.splitext(out_path)[0] + ".bmp"
-            png = os.path.splitext(out_path)[0] + ".png"
-            try:
-                with Image.open(bmp) as im:
-                    im.convert("RGB").save(png)
-                try:
-                    os.unlink(bmp)
-                except Exception:
-                    pass
-                result = (True, png)
-            except Exception as e:
-                _log_exc("twain bmp→png", e)
-                result = (True, bmp)
-        elif state == "cancel":
-            result = (False, "TWAIN: cancelled")
-        elif state == "timeout":
-            result = (False, "TWAIN: timeout")
-        else:
-            result = (False, "TWAIN: transfer failed")
-        return result
-    except Exception as e:
-        _log_exc("twain scan", e)
-        return False, f"TWAIN: {str(e)[:140]}"
-    finally:
-        try:
-            if enabled:
-                ui = _TwUserInterface(0, 0, ctypes.c_void_p(hwnd))
-                _twain_call(dsm, app, src, _DG_CONTROL, _DAT_USERINTERFACE,
-                            _MSG_DISABLEDS, ctypes.byref(ui))
-            if src is not None and src.Id:
-                _twain_call(dsm, app, None, _DG_CONTROL, _DAT_IDENTITY,
-                            _MSG_CLOSEDS, ctypes.byref(src))
-        except Exception as e:
-            _log_exc("twain close ds", e)
-        try:
-            _twain_call(dsm, app, None, _DG_CONTROL, _DAT_PARENT,
-                        _MSG_CLOSEDSM, ctypes.byref(ctypes.c_void_p(None)))
-        except Exception as e:
-            _log_exc("twain close dsm", e)
-        if hwnd:
-            u32.DestroyWindow(ctypes.c_void_p(hwnd))
-
-
-WIA_FORMAT_BMP = "{B96B3CAB-0728-11D3-9D7B-0000F81EF32E}"
-WIA_FORMAT_PNG_REAL = "{B96B3CAF-0728-11D3-9D7B-0000F81EF32E}"
-WIA_FORMAT_JPEG_REAL = "{B96B3CAE-0728-11D3-9D7B-0000F81EF32E}"
-WIA_FORMAT_TIFF = "{B96B3CB1-0728-11D3-9D7B-0000F81EF32E}"
-
-
-def _com_prepare():
-    """
-    comtypes в onefile-сборке пытается генерировать обёртки в _MEIPASS
-    (read-only) — отключаем дисковый кэш, генерация идёт в память.
-    """
-    try:
-        import comtypes.client
-        comtypes.client.gen_dir = None
-        return comtypes.client
-    except Exception as e:
-        _log_exc("comtypes prepare", e)
+                adv.CloseServiceHandle(svc)
+        finally:
+            adv.CloseServiceHandle(scm)
+    except Exception:
         return None
 
 
-def list_wia_scanners():
-    """Список устройств WIA (сканеры + МФУ)."""
-    devices = []
-    cc = _com_prepare()
-    if cc is None:
-        return devices
-    try:
-        dm = cc.CreateObject("WIA.DeviceManager")
-        for i in range(1, dm.DeviceInfos.Count + 1):
-            info = dm.DeviceInfos(i)
-            try:
-                dtype = int(info.Type)
-            except Exception:
-                dtype = 1
-            if dtype == 3:  # чисто видео-устройства пропускаем
-                continue
-            try:
-                name = str(info.Properties("Name").Value)
-            except Exception:
-                try:
-                    name = str(info.Properties(1).Value)
-                except Exception:
-                    name = f"WIA device {i}"
-            tag = "WIA/Camera" if dtype == 2 else "WIA"
-            devices.append((f"wia:{i}", f"{name}  [{tag}]", "wia", i))
-    except Exception as e:
-        _log_exc("WIA list", e)
-    return devices
+class ScanJob:
+    """One scan in a worker process.
 
+    on_event(dict) is called from a reader thread with every worker event. It
+    always ends with exactly one "done" event: when the worker dies (a crashed
+    driver), is stopped by the stall watchdog or is killed after a cancel, the
+    job reports that itself, so the pages received until then are kept.
+    """
 
-def list_twain_scanners():
-    devices = []
-    try:
-        for i, name in enumerate(twain_source_names()):
-            devices.append((f"twain:{i}:{name}", f"{name}  [TWAIN]", "twain", name))
-    except Exception as e:
-        _log_exc("TWAIN list", e)
-    return devices
+    def __init__(self, device: ScanDevice, opts: dict, out_dir: str,
+                 parent_hwnd: int, on_event):
+        self.device = device
+        self.opts = dict(opts)
+        self.out_dir = out_dir
+        self.parent_hwnd = int(parent_hwnd or 0)
+        self.on_event = on_event
+        self.proc = None
+        self.pages = 0
+        self._last = time.time()
+        self._state = "starting"
+        self._done = False
+        self._cancel = False
+        self._killed = None  # None | "cancel" | "stall"
+        self._lock = threading.Lock()
 
+    def args(self, helpers: Path) -> list:
+        o = self.opts
+        a = [str(_helper_exe(helpers, self.device.arch)), "scan",
+             "--backend", self.device.backend, "--device", self.device.device,
+             "--out", self.out_dir,
+             "--dpi", str(int(o.get("dpi", 300))),
+             "--color", o.get("color", "color"),
+             "--source", o.get("source", "flatbed"),
+             "--paper", o.get("paper", "a4"),
+             "--parent", str(self.parent_hwnd),
+             "--log", str(SCAN_HELPER_LOG)]
+        if o.get("ui"):
+            a.append("--ui")
+        if o.get("transfer") == "memory":
+            a += ["--transfer", "memory"]
+        return a
 
-def list_all_scanners():
-    items = list_wia_scanners() + list_twain_scanners()
-    seen = set()
-    uniq = []
-    for it in items:
-        k = it[1].lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(it)
-    uniq.append(("dialog", t("win_dialog"), "dialog", None))
-    return uniq
-
-
-def _wia_save_image(image, out_path: str) -> bool:
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    candidates = [out_path]
-    base = os.path.splitext(out_path)[0]
-    for ext in (".png", ".jpg", ".bmp", ".tif"):
-        candidates.append(base + ext)
-    for p in candidates:
+    def start(self):
+        helpers = scan_helper_dir()
+        if helpers is None:
+            raise FileNotFoundError("NexusScan64.exe")
         try:
-            image.SaveFile(str(p))
-            if os.path.isfile(p) and os.path.getsize(p) > 50:
-                if p != out_path:
-                    # нормализуем в PNG через Pillow если нужно
-                    try:
-                        target = base + ".png"
-                        with Image.open(p) as im0:
-                            im = ImageOps.exif_transpose(im0)
-                            if im.mode in ("RGBA", "P"):
-                                im.save(target)
-                            else:
-                                im.convert("RGB").save(target)
-                        if p != target and os.path.isfile(p):
-                            try:
-                                os.unlink(p)
-                            except Exception:
-                                pass
-                        return True
-                    except Exception as e:
-                        _log_exc("wia normalize", e)
-                        if os.path.getsize(p) > 50:
-                            return True
-                return True
-        except Exception as e:
-            _log_exc("wia SaveFile", e)
-    return False
+            # The driver's window may come to the front: Windows allows that
+            # only to processes the foreground program permits.
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+        except Exception:
+            pass
+        args = self.args(helpers)
+        log.info("scan: %s", " ".join(args[1:]))
+        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, creationflags=CNW,
+                                     startupinfo=_startupinfo(), cwd=str(helpers))
+        _register_proc(self.proc)
+        threading.Thread(target=self._read, daemon=True, name="scan-read").start()
+        threading.Thread(target=self._watch, daemon=True, name="scan-watch").start()
 
+    @property
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
 
-def wia_scan_with_dialog(out_path: str) -> Tuple[bool, str]:
-    """
-    Самый совместимый путь: UI драйвера Windows.
-    Перебираем форматы PNG → JPEG → BMP → TIFF → default.
-    """
-    cc = _com_prepare()
-    if cc is None:
-        return False, "WIA: comtypes error"
-    try:
-        dialog = cc.CreateObject("WIA.CommonDialog")
-        formats = [
-            WIA_FORMAT_PNG_REAL,
-            WIA_FORMAT_JPEG_REAL,
-            WIA_FORMAT_BMP,
-            WIA_FORMAT_TIFF,
-            None,
-        ]
-        last_err = "Cancelled"
-        for fmt in formats:
+    def cancel(self):
+        """Stop after the current page; kill the worker if it does not listen."""
+        with self._lock:
+            if self._cancel or not self.running:
+                return
+            self._cancel = True
+        try:
+            self.proc.stdin.write(b"cancel\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError):
+            pass
+        threading.Timer(SCAN_CANCEL_GRACE, self._kill, args=("cancel",)).start()
+
+    def _kill(self, why: str):
+        if self.running:
+            self._killed = why
+            log.warning("scan worker killed (%s)", why)
             try:
-                if fmt:
-                    # DeviceType=1 Scanner; Intent=0; Bias=0 MaximizeQuality
-                    image = dialog.ShowAcquireImage(1, 0, 0, fmt, False, True, False)
-                else:
-                    image = dialog.ShowAcquireImage()
-                if image is None:
-                    last_err = "Cancelled"
-                    continue
-                base = os.path.splitext(out_path)[0] + ".png"
-                if _wia_save_image(image, base):
-                    for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"):
-                        p = os.path.splitext(out_path)[0] + ext
-                        if os.path.isfile(p) and os.path.getsize(p) > 50:
-                            return True, p
-                    if os.path.isfile(base) and os.path.getsize(base) > 50:
-                        return True, base
-            except Exception as e:
-                last_err = str(e)[:120]
+                self.proc.kill()
+            except OSError:
+                pass
+
+    def _watch(self):
+        while self.running:
+            time.sleep(1.0)
+            # With the driver's window open the user takes their time.
+            if self._state == "waiting_ui":
                 continue
-        return False, last_err
-    except Exception as e:
-        return False, f"WIA: {str(e)[:140]}"
+            if time.time() - self._last > SCAN_STALL_TIMEOUT:
+                self._kill("stall")
+                return
+
+    def _emit(self, ev: dict):
+        try:
+            self.on_event(ev)
+        except Exception as e:
+            _log_exc("scan event handler", e)
+
+    def _read(self):
+        proc = self.proc
+        try:
+            for raw in proc.stdout:
+                try:
+                    ev = json.loads(raw.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                self._last = time.time()
+                kind = ev.get("event")
+                if kind == "status":
+                    self._state = ev.get("code") or self._state
+                elif kind == "page":
+                    self.pages += 1
+                    self._state = "scanning"
+                elif kind == "done":
+                    self._done = True
+                self._emit(ev)
+        except Exception as e:
+            _log_exc("scan read", e)
+        rc = proc.wait()
+        _unregister_proc(proc)
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        if not self._done:
+            if self._killed == "cancel":
+                self._emit({"event": "done", "pages": self.pages, "cancelled": True})
+            else:
+                code = "timeout" if self._killed == "stall" else "driver_crashed"
+                self._emit({"event": "error", "code": code,
+                            "detail": f"worker exit code 0x{rc & 0xFFFFFFFF:08X}"})
+                self._emit({"event": "done", "pages": self.pages, "cancelled": False})
 
 
-def scan_acquire(device_key: str, devices_cache: list, out_path: str,
-                 dpi: int = 200) -> Tuple[bool, str]:
+# ---- page processing ----
+
+def _otsu_threshold(hist: List[int]) -> int:
+    """The grey level that best separates ink from paper (Otsu's method)."""
+    total = sum(hist)
+    if not total:
+        return 128
+    sum_all = sum(i * h for i, h in enumerate(hist))
+    w_b = sum_b = 0
+    best, first, last = -1.0, 128, 128
+    for i in range(256):
+        w_b += hist[i]
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += i * hist[i]
+        m_b = sum_b / w_b
+        m_f = (sum_all - sum_b) / w_f
+        between = w_b * w_f * (m_b - m_f) ** 2
+        if between > best * (1 + 1e-9):
+            best, first, last = between, i, i
+        elif between >= best * (1 - 1e-9):
+            last = i
+    # With no grey levels between ink and paper every threshold in the gap
+    # is equally good: take the middle of it, not the edge next to the ink,
+    # or faint print would fall on the paper side.
+    return (first + last) // 2
+
+
+def to_black_and_white(im):
+    """Greyscale or colour to crisp 1-bit, with the threshold taken from the
+    page itself rather than a fixed 128 (pale paper and faint print survive)."""
+    g = im.convert("L")
+    t_ = _otsu_threshold(g.histogram())
+    t_ = max(96, min(208, t_))
+    return g.point(lambda v: 255 if v > t_ else 0, mode="1")
+
+
+def is_blank_page(im) -> bool:
+    """A blank sheet: practically no pixels much darker than the paper.
+
+    Counted at full resolution in the middle of the page (the edges carry the
+    feeder's shadows). Bleed-through from the other side is only a little
+    darker than the paper and does not count; a lone signature does.
     """
-    Единая точка: выбранное устройство → системный диалог.
-    Диалог показывается не более одного раза за вызов.
+    g = im.convert("L")
+    w, h = g.size
+    mx, my = int(w * 0.06), int(h * 0.06)
+    if w - 2 * mx < 10 or h - 2 * my < 10:
+        return False
+    core = g.crop((mx, my, w - mx, h - my))
+    hist = core.histogram()
+    total = sum(hist)
+    cum, paper = 0, 255
+    for v in range(256):
+        cum += hist[v]
+        if cum * 2 >= total:
+            paper = v
+            break
+    limit = max(0, paper - 80)
+    dark = sum(hist[:limit])
+    return total > 0 and dark / total < SCAN_BLANK_INK
+
+
+def detect_skew_angle(im) -> float:
+    """The small rotation (degrees, counter-clockwise) that makes text lines
+    horizontal; 0.0 when the page has no clear lines.
+
+    The page is reduced to a black-and-white ink mask; for each candidate
+    angle the mask is rotated and squeezed into one column of row averages.
+    Straight text lines give the sharpest alternation of dark and light rows.
     """
-    errors = []
-    dialog_tried = False
+    g = im.convert("L")
+    w, h = g.size
+    scale = 1100.0 / max(w, h)
+    if scale < 1.0:
+        g = g.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                     Image.Resampling.BOX)
+    t_ = _otsu_threshold(g.histogram())
+    ink = g.point(lambda v: 255 if v < t_ else 0)
+    W, H = ink.size
+    m = int(min(W, H) * 0.05)
+    ink = ink.crop((m, m, W - m, H - m))
 
-    if device_key and device_key.startswith("twain:"):
-        for item in devices_cache or []:
-            if item[0] == device_key:
-                ok, res = twain_scan_to_file(str(item[3]), out_path, dpi)
-                if ok:
-                    return ok, res
-                errors.append(res)
-                break
-    elif device_key and (device_key.startswith("wia:") or device_key == "dialog"):
-        # WIA-устройства сканируем через системный диалог: он сам показывает
-        # список устройств, а прямой Connect+Transfer ломается на многих МФУ.
-        ok, res = wia_scan_with_dialog(out_path)
-        dialog_tried = True
-        if ok:
-            return ok, res
-        errors.append(res)
+    def score(angle: float) -> float:
+        r = ink.rotate(angle, resample=Image.Resampling.BILINEAR, expand=False, fillcolor=0)
+        prof = list(r.resize((1, r.size[1]), Image.Resampling.BOX).getdata())
+        return float(sum((prof[i + 1] - prof[i]) ** 2 for i in range(len(prof) - 1)))
 
-    if not dialog_tried:
-        ok, res = wia_scan_with_dialog(out_path)
-        if ok:
-            return ok, res
-        errors.append(res)
-    return False, " | ".join(str(e) for e in errors[-3:])
+    base = score(0.0)
+    best_a, best_s = 0.0, base
+    for k in range(-10, 11):
+        a = k * 0.5
+        if a == 0.0:
+            continue
+        s = score(a)
+        if s > best_s:
+            best_a, best_s = a, s
+    center = best_a
+    for k in range(-5, 6):
+        a = round(center + k * 0.1, 2)
+        if a == center:
+            continue
+        s = score(a)
+        if s > best_s:
+            best_a, best_s = a, s
+    if base <= 0 or best_s < base * 1.06:
+        return 0.0
+    return best_a
+
+
+def deskew_image(im):
+    """Straightens a slightly rotated page. Returns (image, angle)."""
+    angle = detect_skew_angle(im)
+    if abs(angle) < 0.2:
+        return im, 0.0
+    if im.mode == "1":
+        g = im.convert("L").rotate(angle, resample=Image.Resampling.BICUBIC,
+                                   expand=False, fillcolor=255)
+        return g.point(lambda v: 255 if v > 127 else 0, mode="1"), angle
+    if im.mode not in ("L", "RGB"):
+        im = im.convert("RGB")
+    fill = 255 if im.mode == "L" else (255, 255, 255)
+    return im.rotate(angle, resample=Image.Resampling.BICUBIC, expand=False,
+                     fillcolor=fill), angle
+
+
+def save_page_image(im, path_base: str, dpi: float) -> str:
+    """Final page file: 1-bit pages as PNG (lossless and tiny), the rest as a
+    high-quality JPEG without colour subsampling (stamps and blue signatures
+    keep their edges)."""
+    d = (round(dpi), round(dpi)) if dpi and dpi > 0 else None
+    if im.mode == "1":
+        path = path_base + ".png"
+        im.save(path, "PNG", optimize=True, **({"dpi": d} if d else {}))
+        return path
+    if im.mode not in ("L", "RGB"):
+        im = im.convert("RGB")
+    path = path_base + ".jpg"
+    extra = {"subsampling": 0} if im.mode == "RGB" else {}
+    im.save(path, "JPEG", quality=90, optimize=True, **extra, **({"dpi": d} if d else {}))
+    return path
+
+
+def finalize_scan_page(src: str, dst_dir: Path, want_color: str, deskew: bool,
+                       skip_blank: bool, dpi_hint: float = 0) -> dict:
+    """A page from the worker (BMP or the driver's format) to a page file.
+
+    Returns {"path", "blank", "angle"}. The source file is always deleted.
+    The colour mode is enforced here as well: a driver that refused the
+    requested mode delivers a richer one, which is converted down.
+    """
+    try:
+        with Image.open(src) as im0:
+            im0.load()
+            info_dpi = im0.info.get("dpi")
+            im = ImageOps.exif_transpose(im0)
+        dpi = 0.0
+        try:
+            if info_dpi and float(info_dpi[0]) >= 50:
+                dpi = float(info_dpi[0])
+        except (TypeError, ValueError):
+            dpi = 0.0
+        if not dpi:
+            dpi = float(dpi_hint or 0)
+        if im.mode in ("P", "PA"):
+            im = im.convert("RGB")
+        if im.mode in ("RGBA", "LA", "CMYK", "I", "I;16", "F"):
+            im = im.convert("RGB")
+        if want_color == "gray" and im.mode != "L":
+            im = im.convert("L")
+        elif want_color == "bw" and im.mode != "1":
+            im = to_black_and_white(im)
+        if skip_blank and is_blank_page(im):
+            return {"path": None, "blank": True, "angle": 0.0}
+        angle = 0.0
+        if deskew:
+            im, angle = deskew_image(im)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        path = save_page_image(im, str(dst_dir / f"page_{time.time_ns()}"), dpi)
+        return {"path": path, "blank": False, "angle": angle}
+    finally:
+        try:
+            os.unlink(src)
+        except OSError:
+            pass
+
+
+def rotate_page_file(path: str, degrees: int, dst_dir: Path) -> str:
+    """A page turned by 90/180/270 degrees (counter-clockwise), as a new file.
+
+    A page that belongs to the scan session is replaced; a picture that was
+    dragged in from elsewhere is never modified - the turned copy goes into
+    the session folder instead.
+    """
+    method = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
+              270: Image.Transpose.ROTATE_270}[degrees % 360]
+    with Image.open(path) as im0:
+        im0.load()
+        info_dpi = im0.info.get("dpi")
+        im = ImageOps.exif_transpose(im0).transpose(method)
+    dpi = 0.0
+    try:
+        dpi = float(info_dpi[0]) if info_dpi else 0.0
+    except (TypeError, ValueError):
+        dpi = 0.0
+    if im.mode not in ("1", "L", "RGB"):
+        im = im.convert("RGB")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    new = save_page_image(im, str(dst_dir / f"page_{time.time_ns()}"), dpi)
+    if ScanSessionStore.owns(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return new
+
+
+class ScanSessionStore:
+    """Scanned pages live in %LOCALAPPDATA%\\NexusOptimizer\\ScanSession with
+    a manifest of their order. They survive switching sections, closing the
+    program and a crash: a 40-page feeder run is never lost to a misclick."""
+
+    DIR = SCAN_SESSION_DIR
+    FILE = SCAN_SESSION_DIR / "pages.json"
+
+    @classmethod
+    def load(cls) -> List[str]:
+        try:
+            with open(cls.FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return []
+        pages = []
+        for p in data.get("pages", []):
+            p = str(p)
+            if not os.path.isabs(p):
+                p = str(cls.DIR / p)
+            if os.path.isfile(p):
+                pages.append(p)
+        return pages
+
+    @classmethod
+    def save(cls, pages: List[str]):
+        try:
+            cls.DIR.mkdir(parents=True, exist_ok=True)
+            items = [os.path.basename(p) if cls.owns(p) else p for p in pages]
+            tmp = str(cls.FILE) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "pages": items}, f, ensure_ascii=False)
+            os.replace(tmp, cls.FILE)
+        except OSError as e:
+            _log_exc("scan session save", e)
+
+    @classmethod
+    def owns(cls, path: str) -> bool:
+        try:
+            return os.path.normcase(os.path.dirname(os.path.abspath(path))) == \
+                os.path.normcase(str(cls.DIR))
+        except Exception:
+            return False
+
+    @classmethod
+    def sweep(cls, keep: List[str]):
+        """Deletes session files no longer in the list (left by a crash)."""
+        keep_set = {os.path.normcase(os.path.abspath(p)) for p in keep}
+        try:
+            for f in cls.DIR.glob("page_*"):
+                if os.path.normcase(str(f)) not in keep_set:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
 
 # -------------------- PDF --------------------
+#
+# Сжатие PDF — собственный конвейер по изображениям (тот же подход, что в
+# NexusPDF 0.24). Раньше изображения отдавались rewrite_images самого MuPDF,
+# и на корпусе типичных офисных сканов он делал три вещи неправильно:
+#  - уменьшал только ВДВОЕ, а не до цели: скан 300 dpi при цели 100 выходил
+#    150 dpi, а при цели 165 не уменьшался вовсе — весь «выигрыш» давало
+#    низкое качество JPEG, отсюда мыло без экономии;
+#  - серые и CMYK-сканы портил: серый перепривязывался к чужому цветовому
+#    пространству (двоящаяся каша), CMYK становился чёрным прямоугольником;
+#  - 1-битные сканы (факсы, ч/б режим МФУ) уменьшал до 150 dpi — буквы
+#    рассыпались.
+# Теперь каждое изображение решается отдельно, и у каждого решения есть
+# откат. Текстовый слой OCR, закладки, ссылки и формы не трогаются: меняются
+# только потоки изображений.
+
+PDF_IMG_WORTH = 0.85            # замена: новый поток хотя бы на 15 % меньше
+PDF_FILE_WORTH = 0.985          # файл: хотя бы на 1,5 % меньше, иначе исходник
+PDF_DOWN_TRIGGER = 1.30         # плотнее цели на треть — уменьшаем до цели
+PDF_SCAN_COVER = 0.80           # картинка на 80 % листа — страница-скан
+PDF_MIN_STREAM = 2048           # мелочь не окупает ни риска, ни времени
+PDF_INFLIGHT_BYTES = 320 << 20  # пиксели «в работе» одновременно (офисные ПК)
+
+
+def _placement_size(info: dict) -> Tuple[float, float]:
+    """Показанный размер изображения в пунктах — из матрицы размещения.
+    bbox у повёрнутых картинок врёт: это описанный прямоугольник, и скан,
+    вставленный «на боку», выглядел бы в полтора раза плотнее."""
+    try:
+        a, b, c, d = info["transform"][:4]
+        return math.hypot(a, b), math.hypot(c, d)
+    except Exception:
+        bb = info.get("bbox") or (0, 0, 0, 0)
+        return abs(bb[2] - bb[0]), abs(bb[3] - bb[1])
+
 
 def analyze_pdf(path: str) -> dict:
+    """Профиль документа для пресета «умный»: похож ли он на скан и какой у
+    сканов фактический DPI. Скан узнаётся по картинке на весь лист, а не по
+    отсутствию текста: у скана после OCR текста полно (невидимого)."""
     info = {"pages": 0, "images": 0, "text_len": 0, "is_scanned_like": False,
-            "avg_image_dpi": 0.0, "encrypted": False, "error": ""}
+            "avg_image_dpi": 0.0, "scan_pages": 0, "encrypted": False, "error": ""}
     if not fitz:
         return info
     doc = None
@@ -2949,35 +3150,43 @@ def analyze_pdf(path: str) -> dict:
                 info["error"] = "protected"
                 return info
         info["pages"] = doc.page_count
-        total_dpi = dpi_samples = text_len = image_count = 0
-        for i in range(min(info["pages"], 12)):
+        sample = min(info["pages"], 12)
+        text_len = image_count = scan_pages = 0
+        dpis: List[float] = []
+        for i in range(sample):
             page = doc[i]
             try:
                 text_len += len(page.get_text("text") or "")
             except Exception:
                 pass
             try:
-                # get_image_info: размеры БЕЗ декодирования пикселей
+                prect = page.rect
+                area = max(1.0, abs(prect))
+                best = 0.0
+                # get_image_info: размещения БЕЗ декодирования пикселей
                 for im in page.get_image_info():
                     image_count += 1
-                    if dpi_samples < 5:
-                        try:
-                            w = im.get("width", 0)
-                            bbox = im.get("bbox")
-                            bw = (bbox[2] - bbox[0]) if bbox else 0
-                            if w > 0 and bw > 0:
-                                total_dpi += w * 72.0 / bw
-                                dpi_samples += 1
-                        except Exception:
-                            pass
+                    bb = fitz.Rect(im.get("bbox") or (0, 0, 0, 0)) & prect
+                    cover = 0.0 if bb.is_empty else abs(bb) / area
+                    best = max(best, cover)
+                    sw, sh = _placement_size(im)
+                    w, h = im.get("width") or 0, im.get("height") or 0
+                    if cover >= 0.5 and sw > 1 and sh > 1 and w and h:
+                        dpis.append(min(w / (sw / 72.0), h / (sh / 72.0)))
+                if best >= PDF_SCAN_COVER:
+                    scan_pages += 1
             except Exception:
                 pass
         info["images"] = image_count
         info["text_len"] = text_len
-        if dpi_samples:
-            info["avg_image_dpi"] = total_dpi / dpi_samples
-        pages = max(1, info["pages"])
-        info["is_scanned_like"] = image_count >= max(1, pages // 2) and text_len < 40 * pages
+        info["scan_pages"] = scan_pages
+        if dpis:
+            dpis.sort()
+            info["avg_image_dpi"] = dpis[len(dpis) // 2]  # медиана
+        sampled = max(1, sample)
+        by_cover = scan_pages > 0 and scan_pages * 2 >= sampled
+        by_text = image_count >= max(1, sampled // 2) and text_len < 40 * sampled
+        info["is_scanned_like"] = by_cover or by_text
     except Exception as e:
         _log_exc("analyze_pdf", e)
     finally:
@@ -2990,38 +3199,397 @@ def analyze_pdf(path: str) -> dict:
 
 
 def resolve_pdf_params(preset: str, dpi: int, quality: int, info: dict) -> Tuple[int, int, bool]:
-    """Пресет → конкретные (dpi, quality, structure_only)."""
+    """Пресет → конкретные (dpi, quality, structure_only).
+
+    Числа рассчитаны на честное уменьшение до цели: основной выигрыш даёт
+    удаление лишних пикселей, поэтому качество JPEG держится человеческим.
+    Прежние 34–56 были вынужденными: движок не уменьшал, и экономию выжимали
+    из качества — документы выходили мыльными."""
     structure_only = False
     if preset == "smart":
         if info.get("is_scanned_like"):
-            dpi, quality = (100, 42) if info.get("avg_image_dpi", 0) > 140 else (120, 48)
+            # Скан плотнее 160 dpi: 130 dpi на экране и в офисной печати не
+            # отличить, а весит вдвое меньше. Скан около 150 dpi уже в цели —
+            # уменьшать его не из чего, и это честно.
+            dpi, quality = (130, 68) if info.get("avg_image_dpi", 0) > 160 else (150, 70)
         else:
-            dpi, quality = 135, 56
+            dpi, quality = 150, 76
     elif preset == "aggressive":
-        dpi, quality = 85, 35
+        dpi, quality = 96, 45
     elif preset == "max":
-        dpi, quality = 80, 34
+        dpi, quality = 85, 40
     elif preset == "balanced":
-        dpi, quality = 118, 50
+        dpi, quality = 120, 60
     elif preset == "quality":
-        dpi, quality = 165, 68
+        dpi, quality = 220, 85
     elif preset == "structure":
         structure_only = True
         dpi, quality = 130, 60
     elif preset == "images":
-        dpi, quality = 95, 40
+        dpi, quality = 100, 50
     else:  # custom
         dpi = max(50, min(300, safe_int(dpi, 130)))
         quality = max(20, min(95, safe_int(quality, 55)))
     return dpi, quality, structure_only
 
 
+def _pdf_stream_len(doc, xref: int) -> int:
+    """Длина сжатого потока изображения (по словарю, без чтения данных)."""
+    try:
+        kind, val = doc.xref_get_key(xref, "Length")
+        if kind == "int":
+            return int(val)
+        if kind == "xref":
+            return int(doc.xref_object(int(val.split()[0]), compressed=True).strip())
+    except Exception:
+        pass
+    try:
+        return len(doc.xref_stream_raw(xref) or b"")
+    except Exception:
+        return 0
+
+
+def _pdf_obj_text(doc, value: str, depth: int = 2) -> str:
+    """Текст значения и объектов, на которые оно ссылается: у ICCBased число
+    компонентов лежит в словаре профиля, у Indexed база — отдельным объектом."""
+    parts = [value or ""]
+    if depth > 0:
+        for num in re.findall(r"(\d+) \d+ R", value or ""):
+            try:
+                parts.append(_pdf_obj_text(
+                    doc, doc.xref_object(int(num), compressed=True) or "", depth - 1))
+            except Exception:
+                pass
+    return " ".join(parts)
+
+
+def _pdf_mask_is_opaque(doc, value: str) -> bool:
+    """Only an ordinary, entirely white 8-bit mask can be discarded safely.
+    Read from the inspection document: stream reads can change MuPDF caches."""
+    try:
+        xref = int(value.split()[0])
+        if doc.xref_get_key(xref, "BitsPerComponent") != ("int", "8"):
+            return False
+        if doc.xref_get_key(xref, "ColorSpace") != ("name", "/DeviceGray"):
+            return False
+        if any(doc.xref_get_key(xref, k)[0] != "null" for k in ("Decode", "Mask", "SMask")):
+            return False
+        width = int(doc.xref_get_key(xref, "Width")[1])
+        height = int(doc.xref_get_key(xref, "Height")[1])
+        if not 0 < width * height <= 40_000_000:
+            return False
+        pixels = doc.xref_stream(xref)
+        return len(pixels) == width * height and pixels.count(255) == len(pixels)
+    except Exception:
+        return False
+
+
+def _pdf_image_meta(doc, xref: int) -> Optional[dict]:
+    """Ключи изображения без декодирования. None — изображение не трогать."""
+    def key(name):
+        try:
+            return doc.xref_get_key(xref, name)
+        except Exception:
+            return ("null", "null")
+
+    # Прозрачность (мягкая маска, цветовой ключ, трафарет) JPEG испортит.
+    mask_kind, mask_value = key("SMask")
+    opaque_mask = mask_kind == "xref" and _pdf_mask_is_opaque(doc, mask_value)
+    if (mask_kind != "null" and not opaque_mask) or key("Mask")[0] != "null":
+        return None
+    if key("ImageMask")[1] == "true":
+        return None
+    filt = key("Filter")[1]
+    # CCITT/JBIG2 плотнее любого JPEG, а JPX перекодировать — риск без выгоды.
+    if any(f in filt for f in ("CCITT", "JBIG2", "JPX")):
+        return None
+    kind, bpc = key("BitsPerComponent")
+    if kind == "int" and int(bpc) <= 1:
+        return None  # 1-битные сканы: уменьшение рассыпает буквы
+    cs_kind, cs_val = key("ColorSpace")
+    cs_text = _pdf_obj_text(doc, cs_val)
+    # Плашечные цвета и Lab: перевод в RGB меняет вид документа.
+    if any(s in cs_text for s in ("/Separation", "/DeviceN", "/Lab", "/Pattern")):
+        return None
+    indexed = "/Indexed" in cs_text
+    comps = 0
+    if not indexed:
+        if "/DeviceGray" in cs_text or "/CalGray" in cs_text:
+            comps = 1
+        elif "/DeviceRGB" in cs_text or "/CalRGB" in cs_text:
+            comps = 3
+        elif "/DeviceCMYK" in cs_text:
+            comps = 4
+        m = re.search(r"/N (\d)", cs_text)
+        if "/ICCBased" in cs_text and m:
+            comps = int(m.group(1))
+    return {
+        "jpeg": "DCT" in filt,
+        "cs_val": cs_val if cs_kind in ("xref", "array", "name") else "",
+        "icc": "/ICCBased" in cs_text and not indexed,
+        "comps": comps,
+        "length": _pdf_stream_len(doc, xref),
+        "opaque_mask": opaque_mask,
+    }
+
+
+def _pdf_collect_plan(doc) -> dict:
+    """Collect actual image references and their largest displayed dimensions.
+    Pixel hashes used by PyMuPDF resolve objects correctly even when several
+    images have the same dimensions and compressed length. This document is
+    for inspection only; its native caches are never saved."""
+    plan: dict = {}
+    for pno in range(doc.page_count):
+        if stop_flag.is_set():
+            break
+        for info in doc[pno].get_image_info(xrefs=True):
+            xref = info.get("xref", 0)
+            if xref <= 0:
+                continue  # inline images have no replaceable object
+            sw, sh = _placement_size(info)
+            entry = plan.setdefault(xref, {"w": 0.0, "h": 0.0, "page": pno})
+            entry["w"] = max(entry["w"], sw)
+            entry["h"] = max(entry["h"], sh)
+    return plan
+
+
+def _pdf_looks_graphic(img) -> bool:
+    """Мало различных цветов — схема, график, скриншот. Такие картинки
+    остаются без потерь: JPEG даёт ореолы вокруг линий и букв."""
+    w, h = img.size
+    step = max(1, max(w, h) // 256)
+    small = img.resize((max(1, w // step), max(1, h // step)),
+                       Image.Resampling.NEAREST)
+    return small.getcolors(24 if small.mode == "L" else 256) is not None
+
+
+def _pdf_encode_job(job: dict):
+    """Уменьшение и JPEG — без MuPDF, поэтому можно в пуле потоков (Pillow
+    отпускает GIL на ресэмплинге и кодировании). None — оставить как было."""
+    mode = "L" if job["n"] == 1 else "RGB"
+    img = Image.frombytes(mode, (job["w"], job["h"]), job.pop("samples"))
+    if job["graphic_check"] and _pdf_looks_graphic(img):
+        return None
+    if job["gray"] and img.mode != "L":
+        img = img.convert("L")
+    size = (job["new_w"], job["new_h"])
+    if img.size != size:
+        img = img.resize(size, Image.Resampling.LANCZOS, reducing_gap=3.0)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=job["quality"], optimize=True)
+    data = buf.getvalue()
+    if len(data) >= job["old_len"] * PDF_IMG_WORTH:
+        return None  # выигрыш не стоит потери качества
+    return data, img.mode, img.size[0], img.size[1]
+
+
+def _pdf_prepare_image(doc, xref: int, place: dict, target_dpi: int,
+                       quality: int, force_gray: bool) -> Optional[dict]:
+    """Решение по одному изображению и декодирование (только MuPDF-поток)."""
+    meta = _pdf_image_meta(doc, xref)
+    if meta is None or meta["length"] <= PDF_MIN_STREAM:
+        return None
+    try:
+        width = int(doc.xref_get_key(xref, "Width")[1])
+        height = int(doc.xref_get_key(xref, "Height")[1])
+    except Exception:
+        return None
+    if width < 16 or height < 16:
+        return None
+    sx = sy = 1.0
+    if place["w"] > 1 and place["h"] > 1:
+        dpi_x = width / (place["w"] / 72.0)
+        dpi_y = height / (place["h"] / 72.0)
+        if max(dpi_x, dpi_y) > target_dpi * PDF_DOWN_TRIGGER:
+            # каждая ось — к цели отдельно: растянутый скан (факс 204×98)
+            # не теряет плотность по менее плотной оси
+            sx = min(1.0, target_dpi / dpi_x)
+            sy = min(1.0, target_dpi / dpi_y)
+    shrink = sx < 0.999 or sy < 0.999
+    gray = force_gray and meta["comps"] != 1
+    # Quality applies even at the target DPI. The encoded-size gate below
+    # retains already compact JPEGs without another generation of losses.
+    pix = fitz.Pixmap(doc, xref)  # MuPDF сам применит Decode, Indexed, ICC
+    if pix.alpha:
+        pix = fitz.Pixmap(pix, 0)
+    converted = False
+    if pix.n >= 4:
+        # CMYK → RGB: четырёхкомпонентный JPEG читают не все программы
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+        converted = True
+    if pix.n not in (1, 3):
+        return None
+    if pix.n == 1:
+        gray = False
+    new_w = max(16, int(round(width * sx)))
+    new_h = max(16, int(round(height * sy)))
+    # Грубое уменьшение кратно двум — средствами MuPDF (меньше памяти),
+    # последние «меньше двух раз» — Lanczos, чтобы буквы остались чёткими.
+    ratio = min(new_w / pix.width, new_h / pix.height)
+    k = 0
+    while k < 4 and ratio * (2 ** (k + 1)) <= 0.5:
+        k += 1
+    if k:
+        pix.shrink(k)
+    job = {
+        "samples": pix.samples, "w": pix.width, "h": pix.height, "n": pix.n,
+        "new_w": new_w, "new_h": new_h, "gray": gray, "quality": quality,
+        "graphic_check": not meta["jpeg"], "old_len": meta["length"],
+        # собственный ICC-профиль сохраняем, если каналы не менялись
+        "keep_cs": meta["cs_val"] if meta["icc"] and not converted and not gray else "",
+        "opaque_mask": meta["opaque_mask"],
+    }
+    del pix
+    return job
+
+
+def _pdf_apply_image(doc, xref: int, data: bytes, mode: str, w: int, h: int,
+                     keep_cs: str, opaque_mask: bool = False):
+    """Подмена потока на месте: все ссылки (страницы, формы) остаются."""
+    doc.update_stream(xref, data, compress=0)  # снимает Filter и DecodeParms
+    doc.xref_set_key(xref, "Filter", "/DCTDecode")
+    doc.xref_set_key(xref, "Width", str(w))
+    doc.xref_set_key(xref, "Height", str(h))
+    doc.xref_set_key(xref, "BitsPerComponent", "8")
+    doc.xref_set_key(xref, "ColorSpace", keep_cs or (
+        "/DeviceGray" if mode == "L" else "/DeviceRGB"))
+    # пиксели уже декодированы: старая инверсия/параметры фильтра неверны
+    doc.xref_set_key(xref, "Decode", "null")
+    doc.xref_set_key(xref, "DecodeParms", "null")
+    if opaque_mask:
+        doc.xref_set_key(xref, "SMask", "null")
+
+
+def _pdf_recompress_images(doc, target_dpi: int, quality: int, force_gray: bool,
+                           threads: int = 1, progress=None, inspection=None) -> Tuple[int, int]:
+    """Пер-картиночный конвейер. Возвращает (заменено, оставлено как было).
+    MuPDF-вызовы — только в этом потоке; уменьшение и кодирование уходят в
+    пул, а объём пикселей «в работе» ограничен памятью офисного ПК."""
+    from collections import deque
+
+    if inspection is None:
+        # A separate instance also works for unsaved documents used by callers.
+        with fitz.open(stream=doc.tobytes(), filetype="pdf") as reader:
+            return _pdf_recompress_images(doc, target_dpi, quality, force_gray,
+                                          threads, progress, reader)
+    plan = _pdf_collect_plan(inspection)
+    items = sorted(plan.items(), key=lambda kv: kv[1]["page"])
+    total = max(1, len(items))
+    state = {"done": 0, "replaced": 0, "kept": 0, "inflight": 0}
+    pool = ThreadPoolExecutor(max_workers=threads) if threads > 1 else None
+    pending = deque()
+
+    def finish(xref, result, size, keep_cs, opaque_mask=False):
+        state["inflight"] -= size
+        if result:
+            # A failure here may leave the object's dictionary half changed.
+            # Abort the entire staged output; never save a partial replacement.
+            _pdf_apply_image(doc, xref, *result, keep_cs, opaque_mask)
+            state["replaced"] += 1
+        else:
+            state["kept"] += 1
+        state["done"] += 1
+        if progress:
+            progress(state["done"] / total)
+
+    def drain_one():
+        xref, fut, size, keep_cs, opaque_mask = pending.popleft()
+        try:
+            res = fut.result()
+        except Exception as e:
+            _log_exc(f"pdf image encode {xref}", e)
+            res = None
+        finish(xref, res, size, keep_cs, opaque_mask)
+
+    try:
+        for xref, place in items:
+            if stop_flag.is_set():
+                break
+            try:
+                job = _pdf_prepare_image(inspection, xref, place, target_dpi, quality,
+                                         force_gray)
+            except Exception as e:
+                _log_exc(f"pdf image prepare {xref}", e)
+                job = None
+            if job is None:
+                finish(xref, None, 0, "")
+                continue
+            keep_cs = job.pop("keep_cs")
+            opaque_mask = job.pop("opaque_mask")
+            size = len(job["samples"])
+            state["inflight"] += size
+            if pool is None:
+                try:
+                    res = _pdf_encode_job(job)
+                except Exception as e:
+                    _log_exc(f"pdf image encode {xref}", e)
+                    res = None
+                finish(xref, res, size, keep_cs, opaque_mask)
+                continue
+            while pending and (len(pending) >= threads * 2 or
+                               state["inflight"] > PDF_INFLIGHT_BYTES):
+                drain_one()
+            pending.append((xref, pool.submit(_pdf_encode_job, job), size, keep_cs, opaque_mask))
+        while pending:
+            drain_one()
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+    return state["replaced"], state["kept"]
+
+
+def _pdf_output_ok(path: str, pages_expected: int, source: str = None) -> bool:
+    """Validate pages, live image streams and searchable content after saving.
+    A page count alone accepts PDFs whose picture streams have disappeared."""
+    try:
+        with fitz.open(path) as result:
+            if result.page_count != pages_expected:
+                return False
+            for page in result:
+                for image in page.get_images(full=True):
+                    if not result.xref_stream_raw(image[0]):
+                        return False
+            if source is not None:
+                with fitz.open(source) as original:
+                    if original.get_toc() != result.get_toc():
+                        return False
+                    for index in range(pages_expected):
+                        before, after = original[index], result[index]
+                        if before.get_text() != after.get_text():
+                            return False
+                        if len(before.get_links()) != len(after.get_links()):
+                            return False
+                        if before.read_contents() and not after.read_contents():
+                            return False
+                        # Rendering both files catches an otherwise valid blank
+                        # or black page after a failed image rewrite.
+                        a = before.get_pixmap(dpi=36, colorspace=fitz.csGRAY, alpha=False).samples
+                        b = after.get_pixmap(dpi=36, colorspace=fitz.csGRAY, alpha=False).samples
+                        if a and b and max(a) - min(a) >= 16 and max(b) - min(b) < 4:
+                            return False
+            return True
+    except Exception as e:
+        _log_exc("pdf validation", e)
+        return False
+
+
+def _pdf_same_file(inp: str, out: str) -> bool:
+    if os.path.normcase(os.path.realpath(inp)) == os.path.normcase(os.path.realpath(out)):
+        return True
+    try:
+        return os.path.samefile(inp, out)
+    except OSError:
+        return False
+
+
 def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: bool,
-                _resolved: dict = None, progress_cb=None):
+                _resolved: dict = None, progress_cb=None, threads: int = 1):
     """
     Сжатие одного PDF. progress_cb(0..1) — прогресс по стадиям.
-    _resolved — заранее рассчитанные параметры (для кусков многопоточного
-    режима): одинаковое качество на всех страницах и без повторного анализа.
+    _resolved — заранее рассчитанные параметры (без повторного анализа).
+    threads — потоки на уменьшение и кодирование изображений внутри
+    документа (для одиночного большого файла; в пакете — 1, там параллельны
+    сами файлы).
     """
     def cb(frac):
         if progress_cb:
@@ -3033,85 +3601,53 @@ def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: b
     if not fitz:
         return inp, False, "err_pymupdf", 0, 0
     orig = 0
-    tmp = None
+    tmp = candidate = None
     try:
         if not os.path.isfile(inp):
             return inp, False, "err_not_found", 0, 0
         orig = os.path.getsize(inp)
-        if not ensure_disk_space(inp, int(orig * 1.2)):
+        if _pdf_same_file(inp, out):
+            return inp, False, "err_same_file", orig, orig
+        if stop_flag.is_set():
+            return inp, False, "stopped", orig, 0
+        if not ensure_disk_space(out, int(orig * 1.2)):
             return inp, False, "err_no_space", orig, 0
-        cb(0.05)
+        cb(0.04)
 
         if _resolved:
             rdpi = _resolved["dpi"]
             rq = _resolved["quality"]
             structure_only = _resolved["structure_only"]
-            use_gray_raster = _resolved["use_gray_raster"]
+            use_gray = _resolved.get("use_gray", _resolved.get("use_gray_raster", False))
         else:
             info = analyze_pdf(inp)
             if info.get("encrypted"):
                 return inp, False, "err_protected", orig, 0
             rdpi, rq, structure_only = resolve_pdf_params(preset, dpi, quality, info)
-            use_gray_raster = bool(gray) and bool(info.get("is_scanned_like")) \
+            # Серый — для сканов: у вёрстки цвет не трогаем, только жмём
+            # картинки чуть сильнее.
+            use_gray = bool(gray) and bool(info.get("is_scanned_like")) \
                 and not structure_only
-            if gray and not use_gray_raster and not structure_only:
-                # Текстовый PDF: цвет не трогаем, только жмём чуть сильнее
+            if gray and not use_gray and not structure_only:
                 rq = max(28, rq - 8)
 
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=str(TEMP_DIR))
         os.close(fd)
-        cb(0.12)
+        cb(0.08)
 
         doc = fitz.open(inp)
         try:
-            if use_gray_raster:
-                # Безопасный серый для сканов: страница → серая картинка →
-                # новый PDF. DPI не ниже 110, иначе текст «плывёт».
-                render_dpi = max(110, min(int(rdpi), 160))
-                zoom = render_dpi / 72.0
-                mat = fitz.Matrix(zoom, zoom)
-                new_doc = fitz.open()
-                n_pages = max(1, doc.page_count)
-                for page_index in range(doc.page_count):
-                    page = doc[page_index]
-                    try:
-                        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY,
-                                              alpha=False)
-                        rect = page.rect
-                        new_page = new_doc.new_page(width=rect.width, height=rect.height)
-                        img_bytes = pix.tobytes(
-                            "jpeg", jpg_quality=max(35, min(85, rq + 5)))
-                        new_page.insert_image(new_page.rect, stream=img_bytes)
-                        pix = None
-                    except Exception:
-                        try:
-                            new_doc.insert_pdf(doc, from_page=page_index,
-                                               to_page=page_index)
-                        except Exception:
-                            pass
-                    cb(0.12 + 0.66 * (page_index + 1) / n_pages)
-                doc.close()
-                doc = new_doc
-            elif not structure_only:
-                if hasattr(doc, "rewrite_images"):
-                    try:
-                        cb(0.2)
-                        doc.rewrite_images(
-                            dpi_threshold=max(rdpi + 8, 55),
-                            dpi_target=rdpi,
-                            quality=rq,
-                            lossy=True,
-                            lossless=True,
-                            bitonal=True,
-                            color=True,
-                            gray=True,
-                            set_to_gray=False,
-                        )
-                    except Exception as e:
-                        _log_exc("rewrite_images", e)
-                cb(0.78)
-
+            pages_before = doc.page_count
+            if not structure_only:
+                with fitz.open(inp) as inspection:
+                    _pdf_recompress_images(doc, rdpi, rq, use_gray,
+                                           threads=max(1, int(threads or 1)),
+                                           progress=lambda f: cb(0.08 + 0.72 * f),
+                                           inspection=inspection)
+                if stop_flag.is_set():
+                    return inp, False, "stopped", orig, 0
+            cb(0.80)
             kw = dict(garbage=4, deflate=True, deflate_images=True,
                       deflate_fonts=True, use_objstms=1)
             try:
@@ -3125,6 +3661,9 @@ def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: b
             except Exception:
                 pass
 
+        fd, candidate = tempfile.mkstemp(prefix=".nexus-", suffix=".pdf",
+                                           dir=os.path.dirname(os.path.abspath(out)))
+        os.close(fd)
         if pikepdf:
             try:
                 with pikepdf.open(tmp) as pdf:
@@ -3133,23 +3672,35 @@ def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: b
                             del pdf.Root.Metadata
                     except Exception:
                         pass
-                    pdf.save(out, compress_streams=True,
+                    pdf.save(candidate, compress_streams=True,
                              object_stream_mode=pikepdf.ObjectStreamMode.generate,
                              recompress_flate=True)
             except Exception as e:
                 _log_exc("pikepdf pass", e)
-                shutil.copy2(tmp, out)
+                shutil.copy2(tmp, candidate)
         else:
-            shutil.copy2(tmp, out)
-        cb(0.97)
+            shutil.copy2(tmp, candidate)
+        cb(0.95)
 
-        new = os.path.getsize(out)
-        if new >= orig * 0.985:
+        if not _pdf_output_ok(candidate, pages_before, inp):
             try:
-                os.unlink(out)
+                os.unlink(candidate)
+            except Exception:
+                pass
+            return inp, False, "err_bad_result", orig, 0
+
+        new = os.path.getsize(candidate)
+        if new >= orig * PDF_FILE_WORTH:
+            try:
+                os.unlink(candidate)
             except Exception:
                 pass
             return inp, False, "err_no_gain", orig, orig
+        if stop_flag.is_set():
+            return inp, False, "stopped", orig, 0
+        os.replace(candidate, out)
+        candidate = None
+        cb(1.0)
         return inp, True, "OK", orig, new
     except PermissionError as e:
         _log_exc("process_pdf perm", e)
@@ -3158,227 +3709,32 @@ def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: b
         _log_exc("process_pdf", e)
         return inp, False, str(e)[:120], orig, 0
     finally:
-        if tmp and os.path.exists(tmp):
-            try:
-                os.unlink(tmp)
-            except Exception:
-                pass
-
-
-def process_pdf_chunk(args):
-    """
-    Сжать кусок PDF (несколько страниц). Если сжатие куска не дало выигрыша
-    или упало — кусок берётся как есть (страницы не теряются и вся работа
-    не перезапускается).
-    """
-    raw_path, tmp_out, resolved = args
-    try:
-        _i, ok, msg, _o, _n = process_pdf(raw_path, tmp_out, "_resolved",
-                                          0, 0, False, _resolved=resolved)
-        if not ok:
-            shutil.copy2(raw_path, tmp_out)
-            ok = True
-            msg = "copy"
-        return tmp_out, ok, msg, 1
-    except Exception as e:
-        try:
-            shutil.copy2(raw_path, tmp_out)
-            return tmp_out, True, "copy", 1
-        except Exception:
-            return tmp_out, False, str(e)[:100], 0
+        for staged in (tmp, candidate):
+            if staged and os.path.exists(staged):
+                try:
+                    os.unlink(staged)
+                except Exception:
+                    pass
 
 
 def process_single_pdf_parallel(inp: str, out: str, preset: str, dpi: int,
                                 quality: int, gray: bool, workers: int = 0,
                                 progress_cb=None) -> Tuple[str, bool, str, int, int]:
     """
-    Многостраничный PDF → параллель по кускам страниц:
-    1) анализ и выбор параметров ОДИН раз (одинаковое качество всех страниц);
-    2) нарезка; 3) куски параллельно; 4) склейка + pikepdf.
+    Один (большой) PDF. Документ больше НЕ режется на куски: прежняя нарезка
+    со склейкой теряла закладки, формы и общие ресурсы, а одинаковые картинки
+    разных кусков решались по-разному. Параллелится тяжёлая часть —
+    уменьшение и кодирование изображений — в пуле потоков внутри документа.
+    progress_cb(done, total, text) — как у прежней версии.
     """
-    orig = 0
-    raw_chunks: List[Tuple[int, str, int]] = []
-    results: List[Tuple[int, str]] = []
-    try:
-        if not fitz:
-            return process_pdf(inp, out, preset, dpi, quality, gray)
-        if not os.path.isfile(inp):
-            return inp, False, "err_not_found", 0, 0
+    workers = max(1, min(int(workers or MAX_WORKERS), 8))
 
+    def cb(frac):
         if progress_cb:
-            progress_cb(0, 1, "…")
+            progress_cb(frac, 1.0, f"{int(frac * 100)}%")
 
-        orig = os.path.getsize(inp)
-        if not ensure_disk_space(inp, int(orig * 1.5)):
-            return inp, False, "err_no_space", orig, 0
-
-        info = analyze_pdf(inp)
-        if info.get("encrypted"):
-            return inp, False, "err_protected", orig, 0
-        rdpi, rq, structure_only = resolve_pdf_params(preset, dpi, quality, info)
-        use_gray_raster = bool(gray) and bool(info.get("is_scanned_like")) \
-            and not structure_only
-        if gray and not use_gray_raster and not structure_only:
-            rq = max(28, rq - 8)
-        resolved = {"dpi": rdpi, "quality": rq, "structure_only": structure_only,
-                    "use_gray_raster": use_gray_raster}
-
-        doc = fitz.open(inp)
-        n_pages = doc.page_count
-        workers = workers or MAX_WORKERS
-        workers = max(1, min(workers, 8))
-
-        if n_pages < 4 or workers <= 1:
-            doc.close()
-            res = process_pdf(inp, out, preset, dpi, quality, gray)
-            if progress_cb:
-                progress_cb(n_pages, max(n_pages, 1),
-                            t("done") if res[1] else t("error"))
-            return res
-
-        chunk_size = max(2, (n_pages + workers - 1) // workers)
-        if n_pages >= 30:
-            chunk_size = max(5, min(15, n_pages // max(workers, 1)))
-
-        TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-        for start in range(0, n_pages, chunk_size):
-            if stop_flag.is_set():
-                doc.close()
-                return inp, False, "stopped", orig, 0
-            end = min(n_pages - 1, start + chunk_size - 1)
-            part = fitz.open()
-            part.insert_pdf(doc, from_page=start, to_page=end)
-            raw = str(TEMP_DIR / f"chunk_raw_{start}_{end}_{time.time_ns()}.pdf")
-            part.save(raw)
-            part.close()
-            raw_chunks.append((start, raw, end - start + 1))
-            if progress_cb:
-                progress_cb(end + 1, n_pages, f"{end + 1}/{n_pages}")
-        doc.close()
-
-        if progress_cb:
-            progress_cb(0, n_pages, f"⇉ {len(raw_chunks)} × {workers}")
-
-        done_pages = 0
-        jobs = []
-        for start, raw, pc in raw_chunks:
-            tmp_out = str(TEMP_DIR / f"chunk_out_{start}_{time.time_ns()}.pdf")
-            jobs.append((start, raw, tmp_out, pc))
-
-        failed = False
-        with get_executor(min(workers, len(jobs))) as ex:
-            futs = {ex.submit(process_pdf_chunk, (raw, tmp_out, resolved)): (start, raw, tmp_out, pc)
-                    for start, raw, tmp_out, pc in jobs}
-            for fut in as_completed(futs):
-                start, raw, tmp_out, pc = futs[fut]
-                try:
-                    out_path, ok, msg, _ = fut.result()
-                except Exception as e:
-                    _log_exc("chunk future", e)
-                    ok, out_path = False, tmp_out
-                try:
-                    if os.path.isfile(raw):
-                        os.unlink(raw)
-                except Exception:
-                    pass
-                if stop_flag.is_set():
-                    continue
-                if ok and os.path.isfile(out_path):
-                    results.append((start, out_path))
-                    done_pages += pc
-                    if progress_cb:
-                        progress_cb(done_pages, n_pages, f"{done_pages}/{n_pages}")
-                else:
-                    failed = True
-
-        if stop_flag.is_set():
-            return inp, False, "stopped", orig, 0
-        if failed or not results:
-            # редчайший случай (кусок даже скопировать не удалось)
-            for _, p in results:
-                try:
-                    os.unlink(p)
-                except Exception:
-                    pass
-            if progress_cb:
-                progress_cb(0, n_pages, t("fallback_single"))
-            return process_pdf(inp, out, preset, dpi, quality, gray)
-
-        if progress_cb:
-            progress_cb(n_pages, n_pages, "…PDF")
-
-        results.sort(key=lambda x: x[0])
-        merged = fitz.open()
-        for _, p in results:
-            try:
-                part = fitz.open(p)
-                merged.insert_pdf(part)
-                part.close()
-            except Exception as e:
-                _log_exc("merge chunk", e)
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
-        results = []
-
-        if merged.page_count == 0:
-            merged.close()
-            return process_pdf(inp, out, preset, dpi, quality, gray)
-
-        raw_merged = str(TEMP_DIR / f"merged_{time.time_ns()}.pdf")
-        merged.save(raw_merged, garbage=4, deflate=True)
-        merged.close()
-
-        if pikepdf:
-            try:
-                with pikepdf.open(raw_merged) as pdf:
-                    pdf.save(out, compress_streams=True,
-                             object_stream_mode=pikepdf.ObjectStreamMode.generate,
-                             recompress_flate=True)
-            except Exception as e:
-                _log_exc("pikepdf merged", e)
-                shutil.copy2(raw_merged, out)
-        else:
-            shutil.copy2(raw_merged, out)
-        try:
-            os.unlink(raw_merged)
-        except Exception:
-            pass
-
-        new = os.path.getsize(out) if os.path.isfile(out) else 0
-        if new < 100 or new >= orig * 0.985:
-            try:
-                if os.path.isfile(out):
-                    os.unlink(out)
-            except Exception:
-                pass
-            return inp, False, "err_no_gain", orig, orig
-
-        if progress_cb:
-            progress_cb(n_pages, n_pages, t("done"))
-        return inp, True, "OK", orig, new
-    except PermissionError as e:
-        _log_exc("process_pdf_parallel perm", e)
-        return inp, False, "err_no_access", orig, 0
-    except Exception as e:
-        _log_exc("process_pdf_parallel", e)
-        return inp, False, str(e)[:120], orig, 0
-    finally:
-        # никаких сирот в TEMP
-        for _s, raw, _pc in raw_chunks:
-            try:
-                if os.path.isfile(raw):
-                    os.unlink(raw)
-            except Exception:
-                pass
-        for _s, p in results:
-            try:
-                if os.path.isfile(p):
-                    os.unlink(p)
-            except Exception:
-                pass
+    return process_pdf(inp, out, preset, dpi, quality, gray,
+                       progress_cb=cb, threads=workers)
 
 
 # -------------------- Image --------------------
@@ -3656,6 +4012,21 @@ def _draw_icon(name: str, color) -> "Image.Image":
         d.line([42, 26, 32, 36], fill=c, width=w, joint="curve")
         d.line([12, 42, 12, 54, 52, 54, 52, 42], fill=c, width=w,
                joint="curve")
+    elif name in ("rot_l", "rot_r"):  # поворот страницы: дуга со стрелкой
+        import math as _m
+        cx = cy = 32
+        r = 19
+        # дуга по часовой от 300° до 210°: открыта сверху слева
+        d.arc([cx - r, cy - r, cx + r, cy + r], start=300, end=210, fill=c, width=w)
+        a = _m.radians(300)
+        ex, ey = cx + r * _m.cos(a), cy + r * _m.sin(a)
+        ux, uy = _m.sin(a), -_m.cos(a)          # движение против часовой
+        px, py = -uy, ux
+        tip = (ex + ux * 11, ey + uy * 11)
+        d.polygon([tip, (ex + px * 9 - ux * 2, ey + py * 9 - uy * 2),
+                   (ex - px * 9 - ux * 2, ey - py * 9 - uy * 2)], fill=c)
+        if name == "rot_r":
+            im = ImageOps.mirror(im)
     return im
 
 
@@ -3952,11 +4323,16 @@ class BaseSection(ctk.CTkFrame):
                     self._finish_run("error", CLR_ERR)
                     if item[1]:
                         self.show_toast(str(item[1]), "err")
+                else:
+                    self._on_msg(item)
         except queue.Empty:
             pass
         except Exception as e:
             _log_exc("poll", e)
         self._poll_id = self.after(60, self._poll)
+
+    def _on_msg(self, item):
+        """Сообщения, которые понимает только конкретный раздел."""
 
     def show_toast(self, text: str, kind: str = "ok", action=None,
                    timeout: int = 6000):
@@ -5453,50 +5829,119 @@ class VideoSection(BaseSection):
 
 class ScanSection(BaseSection):
     """
-    Сканер: окно драйвера (WIA/TWAIN/системное) → страницы в списке →
-    сохранить PDF / JPG. Сжатие можно включить или выключить.
+    Сканер: выбор устройства → свои настройки или окно драйвера → страницы
+    появляются по одной, пока сканер их отдаёт → поворот, порядок, удаление →
+    PDF или JPG. Само сканирование идёт в отдельном процессе (ScanJob), так
+    что упавший драйвер не уносит программу и уже полученные страницы.
     """
     EXTS = IMAGE_EXTS
     EMPTY_KEY = "no_pages_scan"
     MODE = "Scan"
 
+    OPT_W = 196  # ширина выпадающих списков в левой колонке
+
     def __init__(self, app):
-        self.devices_cache = []
-        self.pages: List[str] = []
+        self.devices: List[ScanDevice] = []
+        self.pages: List[str] = ScanSessionStore.load()
+        ScanSessionStore.sweep(self.pages)
+        self._job: Optional[ScanJob] = None
+        self._job_info: dict = {}
+        self._pages_q: queue.Queue = queue.Queue()
+        self._listing = False
         super().__init__(app, "scanner")
+        threading.Thread(target=self._page_worker, daemon=True,
+                         name="scan-pages").start()
+        self._refresh_pages_ui()
+        if self.pages:
+            self._log(t("scan_restored").format(n=len(self.pages)))
         self._refresh_scanners()
+
+    # ---------------------------------------------------------------- UI
 
     def _build(self):
         self._build_header(t("scanner"))
-
         body = ctk.CTkFrame(self, fg_color="transparent")
         # body упаковывается ПОСЛЕ нижних панелей — кнопки всегда видны
 
-        # LEFT — прокручиваемая колонка: при любой высоте окна ни один
-        # элемент не «исчезает», в крайнем случае появляется скролл
         left = ctk.CTkScrollableFrame(body, corner_radius=10, width=320)
         left.pack(side="left", fill="y", padx=(0, 6))
 
-        ctk.CTkLabel(left, text=t("scanner"),
-                     font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
-                                                           pady=(6, 4))
-        self.dev_list = tk.Listbox(left, height=5, font=("Segoe UI", 12),
+        def head(text, top=10):
+            ctk.CTkLabel(left, text=text, font=ctk.CTkFont(weight="bold")).pack(
+                anchor="w", padx=10, pady=(top, 4))
+
+        head(t("scanner"), 6)
+        self.dev_list = tk.Listbox(left, height=4, font=("Segoe UI", 12),
                                    relief="flat", highlightthickness=0,
-                                   activestyle="none")
+                                   activestyle="none", exportselection=False)
         style_listbox(self.dev_list)
         self._lbs.append(self.dev_list)
         self.dev_list.pack(fill="x", padx=10, pady=2)
-        btn_ghost(left, text=t("refresh_dev"),
-                  command=self._refresh_scanners).pack(fill="x", padx=10,
-                                                       pady=(4, 6))
-        ctk.CTkLabel(left, text=t("scan_hint"), text_color=CLR_MUTED,
-                     justify="left",
-                     font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10,
-                                                     pady=(0, 4))
+        self.dev_list.bind("<<ListboxSelect>>", lambda _e: self._remember_device())
+        self.refresh_btn = btn_ghost(left, text=t("refresh_dev"),
+                                     command=self._refresh_scanners)
+        self.refresh_btn.pack(fill="x", padx=10, pady=(4, 2))
+        self.dev_note = ctk.CTkLabel(left, text="", text_color=CLR_MUTED,
+                                     justify="left", wraplength=280,
+                                     font=ctk.CTkFont(size=12))
+        self.dev_note.pack(anchor="w", padx=10, pady=(0, 2))
 
-        ctk.CTkLabel(left, text=t("folder"),
-                     font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
-                                                           pady=(4, 2))
+        head(t("scan_settings"))
+        self.ui_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(left, text=t("scan_use_ui"), variable=self.ui_var,
+                        fg_color=CLR_ACC, hover_color=CLR_ACC_HOVER,
+                        command=self._toggle_ui_mode).pack(anchor="w", padx=10,
+                                                           pady=(0, 4))
+        # подсказка и поля живут в одном контейнере: переключение не
+        # сдвигает остальные блоки колонки
+        mode_box = ctk.CTkFrame(left, fg_color="transparent")
+        mode_box.pack(fill="x")
+        self.ui_hint = ctk.CTkLabel(mode_box, text=t("scan_hint_ui"),
+                                    text_color=CLR_MUTED, justify="left",
+                                    wraplength=280, font=ctk.CTkFont(size=12))
+        self.opts_frame = ctk.CTkFrame(mode_box, fg_color="transparent")
+        self.opts_frame.pack(fill="x", padx=6, pady=0)
+
+        self._src_map = {t("scan_src_flatbed"): "flatbed",
+                         t("scan_src_feeder"): "feeder",
+                         t("scan_src_duplex"): "duplex"}
+        self._col_map = {t("scan_col_color"): "color",
+                         t("scan_col_gray"): "gray",
+                         t("scan_col_bw"): "bw"}
+        self._dpi_map = {f"{d} dpi": d for d in SCAN_DPIS}
+        self._pap_map = {"A4": "a4", "Letter": "letter", "Legal": "legal",
+                         t("scan_pap_auto"): "auto"}
+        self.src_var = ctk.StringVar(value=t("scan_src_flatbed"))
+        self.col_var = ctk.StringVar(value=t("scan_col_color"))
+        self.dpi_var = ctk.StringVar(value="300 dpi")
+        self.pap_var = ctk.StringVar(value="A4")
+        for label, var, mapping in ((t("scan_source"), self.src_var, self._src_map),
+                                    (t("scan_color"), self.col_var, self._col_map),
+                                    (t("scan_dpi"), self.dpi_var, self._dpi_map),
+                                    (t("scan_paper"), self.pap_var, self._pap_map)):
+            row = ctk.CTkFrame(self.opts_frame, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=3)
+            ctk.CTkLabel(row, text=label, anchor="w", width=88).pack(side="left")
+            # dynamic_resizing=False: все списки одной ширины, длинное
+            # «Автоподатчик, 2 стороны» не выпирает влево
+            ctk.CTkOptionMenu(row, variable=var, values=list(mapping.keys()),
+                              width=self.OPT_W, dynamic_resizing=False,
+                              fg_color=CLR_GHOST,
+                              button_color=CLR_GHOST_HOVER,
+                              button_hover_color=CLR_ACC,
+                              text_color=CLR_GHOST_TEXT).pack(side="right")
+
+        head(t("scan_after"))
+        self.deskew_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(left, text=t("scan_deskew"), variable=self.deskew_var,
+                        fg_color=CLR_ACC, hover_color=CLR_ACC_HOVER).pack(
+            anchor="w", padx=10, pady=2)
+        self.blank_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(left, text=t("scan_skip_blank"), variable=self.blank_var,
+                        fg_color=CLR_ACC, hover_color=CLR_ACC_HOVER).pack(
+            anchor="w", padx=10, pady=2)
+
+        head(t("folder"), 12)
         fr = ctk.CTkFrame(left, fg_color="transparent")
         fr.pack(fill="x", padx=10, pady=2)
         self.folder_var = ctk.StringVar(
@@ -5504,23 +5949,18 @@ class ScanSection(BaseSection):
         ctk.CTkEntry(fr, textvariable=self.folder_var, width=220).pack(side="left")
         btn_ghost(fr, text="…", width=36,
                   command=self._browse_folder).pack(side="left", padx=4)
-
         self.open_after_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(left, text=t("open_after"),
                         variable=self.open_after_var,
                         fg_color=CLR_ACC, hover_color=CLR_ACC_HOVER).pack(
             anchor="w", padx=10, pady=(6, 2))
 
-        # Compression block
-        ctk.CTkLabel(left, text=t("comp_settings"),
-                     font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
-                                                           pady=(10, 4))
+        head(t("comp_settings"))
         self.compress_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(left, text=t("compress_doc"), variable=self.compress_var,
                         fg_color=CLR_ACC, hover_color=CLR_ACC_HOVER,
                         command=self._toggle_comp_ui).pack(anchor="w", padx=10,
                                                            pady=2)
-
         self.comp_frame = ctk.CTkFrame(left, fg_color="transparent")
         self.comp_frame.pack(fill="x", padx=6, pady=2)
         r2 = ctk.CTkFrame(self.comp_frame, fg_color="transparent")
@@ -5539,17 +5979,13 @@ class ScanSection(BaseSection):
         self.comp_dpi = ctk.StringVar(value="130")
         ctk.CTkEntry(r3, textvariable=self.comp_dpi, width=55).pack(side="left", padx=4)
         ctk.CTkLabel(r3, text=t("quality_short")).pack(side="left", padx=(6, 2))
-        self.comp_q = ctk.StringVar(value="55")
+        self.comp_q = ctk.StringVar(value="68")
         ctk.CTkEntry(r3, textvariable=self.comp_q, width=50).pack(side="left")
         self.gray_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(self.comp_frame, text=t("gray_pdf"),
                         variable=self.gray_var,
                         fg_color=CLR_ACC, hover_color=CLR_ACC_HOVER).pack(
-            anchor="w", padx=4, pady=4)
-
-        btn_ghost(left, text=t("del_temp"),
-                  command=self._cleanup_temps).pack(fill="x", padx=10,
-                                                    pady=(8, 8))
+            anchor="w", padx=4, pady=(4, 8))
 
         # RIGHT: pages
         right = ctk.CTkFrame(body, corner_radius=10)
@@ -5565,9 +6001,16 @@ class ScanSection(BaseSection):
         # их не выдавливает за край
         br = ctk.CTkFrame(right, fg_color="transparent")
         br.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
+        btn_ghost(br, text="", image=icon("rot_l", 20), width=44,
+                  command=lambda: self._rotate_selected(90)).pack(side="left")
+        btn_ghost(br, text="", image=icon("rot_r", 20), width=44,
+                  command=lambda: self._rotate_selected(270)).pack(side="left",
+                                                                   padx=(4, 10))
+        btn_ghost(br, text=t("scan_select_all"), width=110,
+                  command=self._select_all_pages).pack(side="left", padx=(0, 6))
         btn_ghost(br, text=t("remove_sel"), width=130,
                   command=self._remove_pages).pack(side="left", padx=(0, 6))
-        btn_ghost(br, text=t("clear_list"), width=130,
+        btn_ghost(br, text=t("clear_list"), width=120,
                   command=self._clear_pages).pack(side="left")
 
         # Страницы — сетка миниатюр: клик = выбор, перетаскивание = порядок
@@ -5577,7 +6020,6 @@ class ScanSection(BaseSection):
         self._page_sel: set = set()
         self._page_cards: dict = {}
         self._drag = {"path": None, "moved": False, "x": 0, "y": 0}
-        # колонки сетки подстраиваются под ширину области
         self._page_cols_cur = 5
         self._resize_job = None
         self.pages_area.bind("<Configure>", self._on_pages_resize)
@@ -5594,47 +6036,51 @@ class ScanSection(BaseSection):
         act.pack(side="bottom", fill="x", padx=12, pady=4)
         af = ctk.CTkFrame(act, fg_color="transparent")
         af.pack(fill="x", padx=10, pady=10)
-        btn_primary(af, text=t("scan_btn"), width=170, height=42,
-                    image=icon_active("scan", 16), compound="left",
-                    font=ctk.CTkFont(size=14, weight="bold"),
-                    command=self._scan_page).pack(side="left", padx=(0, 10))
-        btn_ghost(af, text=t("save_pdf"), width=140, height=42,
+        self.scan_btn = btn_primary(af, text=t("scan_btn"), width=180, height=42,
+                                    image=icon_active("scan", 16), compound="left",
+                                    font=ctk.CTkFont(size=14, weight="bold"),
+                                    command=self._scan)
+        self.scan_btn.pack(side="left", padx=(0, 10))
+        btn_ghost(af, text=t("save_pdf"), width=150, height=42,
                   command=self._save_one_pdf).pack(side="left", padx=(0, 8))
-        btn_ghost(af, text=t("save_jpg"), width=140, height=42,
-                  command=self._save_jpg).pack(side="left", padx=(0, 8))
-        btn_ghost(af, text=t("save_files"), width=150, height=42,
+        btn_ghost(af, text=t("save_jpg"), width=150, height=42,
                   command=self._save_jpg).pack(side="left")
 
         bot = ctk.CTkFrame(self, fg_color="transparent")
         bot.pack(side="bottom", fill="x", padx=12, pady=(2, 10))
-        self.progress = ctk.CTkProgressBar(bot, height=7)
+        self.progress = ctk.CTkProgressBar(bot, height=7, progress_color=CLR_ACC)
         self.progress.pack(fill="x", pady=(0, 4))
         self.progress.set(0)
         self.log = ctk.CTkTextbox(bot, height=84, font=ctk.CTkFont(size=13))
         self.log.pack(fill="x")
         body.pack(side="top", fill="both", expand=True, padx=12, pady=4)
-        self.log.insert("1.0",
-            "1) Выберите сканер\n"
-            "2) «Сканировать…» — откроется окно драйвера (все настройки там)\n"
-            "3) Можно сканировать несколько раз — страницы собираются в списке\n"
-            "4) Сохраните: один PDF, JPG или по отдельным файлам\n"
-            if LANG == "ru" else
-            "1) Pick a scanner\n"
-            "2) Scan… opens the driver window (all settings there)\n"
-            "3) Scan multiple times — pages are collected in the list\n"
-            "4) Save: single PDF, JPG or separate files\n")
+        self.log.insert("1.0", t("scan_help") + "\n")
         self.log.configure(state="disabled")
         self.count_label = self.pages_count
         self._toggle_comp_ui()
+        self._toggle_ui_mode()
 
     def _toggle_comp_ui(self):
+        # блок сжатия — последний в колонке, ему достаточно встать в конец
         if self.compress_var.get():
             self.comp_frame.pack(fill="x", padx=6, pady=2)
         else:
             self.comp_frame.pack_forget()
 
+    def _toggle_ui_mode(self):
+        """В окне драйвера пользователь всё выбирает сам — наши поля прячем."""
+        if self.ui_var.get():
+            self.opts_frame.pack_forget()
+            self.ui_hint.pack(anchor="w", padx=10, pady=(0, 4))
+        else:
+            self.ui_hint.pack_forget()
+            self.opts_frame.pack(fill="x", padx=6, pady=0)
+
     def on_leave(self):
-        self._cleanup_temps(silent=True)
+        # Страницы НЕ удаляются: они живут в сеансе до «Очистить список».
+        if self._job is not None:
+            self._job.cancel()
+        self._pages_q.put(None)
         super().on_leave()
 
     def _browse_folder(self):
@@ -5643,89 +6089,360 @@ class ScanSection(BaseSection):
             self.folder_var.set(d)
 
     def _on_pdf_preset(self, choice: str):
+        # те же числа, что у resolve_pdf_params (скан плотнее 160 dpi)
         m = {
-            t("smart_pdf"): (130, 55),
-            t("aggressive"): (85, 35),
-            t("max_compress"): (80, 34),
-            t("balanced"): (118, 50),
-            t("quality"): (165, 68),
+            t("smart_pdf"): (130, 68),
+            t("aggressive"): (96, 45),
+            t("max_compress"): (85, 40),
+            t("balanced"): (120, 60),
+            t("quality"): (220, 85),
         }
         if choice in m:
             d, q = m[choice]
             self.comp_dpi.set(str(d))
             self.comp_q.set(str(q))
 
+    # ---------------------------------------------------------- devices
+
     def _refresh_scanners(self):
-        self._log("…")
+        if self._listing:
+            return
+        self._listing = True
+        try:
+            self.refresh_btn.configure(state="disabled")
+            self.dev_note.configure(text=t("scan_searching"))
+        except Exception:
+            pass
 
         def work():
             try:
-                devices = list_all_scanners()
+                devices, notes = list_scanners()
             except Exception as e:
                 _log_exc("refresh scanners", e)
-                devices = []
-            def apply_ui():
-                try:
-                    if not self.winfo_exists():
-                        return
-                    self.devices_cache = devices
-                    self.dev_list.delete(0, "end")
-                    for _key, name, _source, _ref in devices:
-                        self.dev_list.insert("end", name)
-                    n_wia = sum(1 for x in devices if x[2] == "wia")
-                    n_tw = sum(1 for x in devices if x[2] == "twain")
-                    self._log(f"WIA: {n_wia}, TWAIN: {n_tw}")
-                    if devices:
-                        self.dev_list.selection_set(0)
-                except Exception as e:
-                    _log_exc("scanners ui", e)
+                devices, notes = [], [{"code": "internal", "detail": str(e)}]
+            wia_off = False
+            if not any(d.backend == "wia" for d in devices):
+                wia_off = wia_service_running() is False
+            self.msg_queue.put(("scan_devices", (devices, notes, wia_off)))
+
+        threading.Thread(target=work, daemon=True, name="scan-list").start()
+
+    def _apply_devices(self, devices, notes, wia_off):
+        self._listing = False
+        self.devices = devices
+        try:
+            self.refresh_btn.configure(state="normal")
+            self.dev_list.delete(0, "end")
+            for d in devices:
+                self.dev_list.insert("end", d.label)
+            want = load_settings().get("scan_device") or ""
+            idx = next((i for i, d in enumerate(devices) if d.key == want), 0)
+            if devices:
+                self.dev_list.selection_set(idx)
+                self.dev_list.see(idx)
+            codes = {n.get("code") for n in notes}
+            if "helpers_missing" in codes:
+                note = t("scan_err_helpers_missing")
+            elif not devices:
+                note = t("scan_no_devices")
+                if wia_off:
+                    note += "\n\n" + t("scan_err_wia_service")
+            else:
+                note = t("scan_found").format(n=len(devices))
+            self.dev_note.configure(text=note)
+            self._log(f"{t('scanner')}: " + (", ".join(d.label for d in devices) or "—"))
+            for n in notes:
+                log.info("scanner note: %s", n)
+        except Exception as e:
+            _log_exc("scanners ui", e)
+
+    def _selected_device(self) -> Optional[ScanDevice]:
+        sel = self.dev_list.curselection()
+        if sel and 0 <= sel[0] < len(self.devices):
+            return self.devices[sel[0]]
+        return self.devices[0] if len(self.devices) == 1 else None
+
+    def _remember_device(self):
+        dev = self._selected_device()
+        if dev is not None:
+            s = load_settings()
+            s["scan_device"] = dev.key
+            save_settings(s)
+
+    # ------------------------------------------------------------ scanning
+
+    def _scan_opts(self) -> dict:
+        return {
+            "ui": bool(self.ui_var.get()),
+            "source": self._src_map.get(self.src_var.get(), "flatbed"),
+            "color": self._col_map.get(self.col_var.get(), "color"),
+            "dpi": self._dpi_map.get(self.dpi_var.get(), 300),
+            "paper": self._pap_map.get(self.pap_var.get(), "a4"),
+        }
+
+    def _scan(self):
+        if self._job is not None:
+            self._cancel_scan()
+            return
+        if self.is_running:
+            return
+        dev = self._selected_device()
+        if dev is None:
+            self.show_toast(t("scan_pick_device") if self.devices
+                            else t("scan_no_devices"), "warn")
+            return
+        opts = self._scan_opts()
+        out_dir = TEMP_DIR / f"scanjob_{time.time_ns()}"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.show_toast(str(e), "err")
+            return
+        try:
+            parent = ctypes.windll.user32.GetAncestor(self.winfo_id(), 2)  # GA_ROOT
+        except Exception:
+            parent = 0
+        self._job_info = {"opts": opts, "device": dev, "out": str(out_dir),
+                          "added": 0, "blank": 0, "straight": 0,
+                          "error": None, "warnings": [], "feeder": None,
+                          "dpi": opts["dpi"]}
+        job = ScanJob(dev, opts, str(out_dir), parent,
+                      lambda ev: self.msg_queue.put(("scan_event", ev)))
+        try:
+            job.start()
+        except Exception as e:
+            _log_exc("scan start", e)
+            self.show_toast(t("scan_err_helpers_missing"), "err")
+            return
+        self._job = job
+        self.is_running = True
+        save_settings(self._collect())
+        self._log(f"——— {dev.label} ———")
+        self.scan_btn.configure(text=t("scan_cancel"))
+        self._set_status(t("scan_st_opening"), CLR_WARN)
+        self.msg_queue.put(("busy", True))
+
+    def _cancel_scan(self):
+        if self._job is None:
+            return
+        self._set_status(t("stopping"), CLR_WARN)
+        self._log("⏹ " + t("stopping"))
+        self._job.cancel()
+
+    def _stop(self):
+        """Esc: остановить сканирование."""
+        if self._job is not None:
+            self._cancel_scan()
+
+    def _set_status(self, text: str, color=None):
+        try:
+            self.status.configure(text=text, text_color=color or CLR_MUTED)
+        except Exception:
+            pass
+
+    def _on_msg(self, item):
+        kind = item[0]
+        if kind == "scan_event":
+            self._on_scan_event(item[1])
+        elif kind == "scan_devices":
+            self._apply_devices(*item[1])
+        elif kind == "scan_page_ready":
+            self._add_scanned_page(item[1])
+        elif kind == "scan_finished":
+            self._finish_scan(item[1])
+        elif kind == "scan_rotated":
+            self._apply_rotation(item[1])
+
+    def _on_scan_event(self, ev: dict):
+        info = self._job_info
+        kind = ev.get("event")
+        if kind == "status":
+            code = ev.get("code")
+            if code == "opening":
+                self._set_status(t("scan_st_opening"), CLR_WARN)
+            elif code == "waiting_ui":
+                self._set_status(t("scan_st_waiting_ui"), CLR_WARN)
+            elif code == "scanning":
+                # счётчик честный: со сканера пришло столько-то изображений
+                # (пустые обороты тоже), сохранено — видно по карточкам
+                n = info.get("received", 0)
+                self._set_status(t("scan_st_scanning").format(n=n) if n
+                                 else t("scan_st_scanning0"), CLR_WARN)
+        elif kind == "settings":
+            info["feeder"] = bool(ev.get("feeder"))
+            if ev.get("dpi"):
+                info["dpi"] = ev.get("dpi")
+            color = {"color": t("scan_col_color"), "gray": t("scan_col_gray"),
+                     "bw": t("scan_col_bw")}.get(ev.get("color"), ev.get("color"))
+            src = (t("scan_src_duplex") if ev.get("duplex") else
+                   t("scan_src_feeder") if ev.get("feeder") else
+                   t("scan_src_flatbed"))
+            self._log(f"{ev.get('dpi')} dpi · {color} · {src}")
+        elif kind == "warning":
+            code = ev.get("code", "")
+            text = t("scan_warn_" + code) if ("scan_warn_" + code) in \
+                TRANSLATIONS.get(LANG, {}) else code
+            if "{dpi}" in text:
+                text = text.format(dpi=ev.get("dpi", ""))
+            info["warnings"].append(text)
+            self._log("⚠ " + text)
+        elif kind == "page":
+            info["received"] = info.get("received", 0) + 1
+            self._set_status(t("scan_st_scanning").format(n=info["received"]),
+                             CLR_WARN)
+            # Обработка (поворот, проверка на пустоту, JPEG) — в фоне, по
+            # порядку прихода страниц.
+            self._pages_q.put(("page", ev, dict(info["opts"]), info.get("feeder"),
+                               info.get("dpi"), bool(self.deskew_var.get()),
+                               bool(self.blank_var.get())))
+        elif kind == "error":
+            info["error"] = ev
+            self._log("✗ " + self._error_text(ev))
+        elif kind == "done":
+            # «Готово» — после всех страниц в очереди обработки
+            self._pages_q.put(("done", ev))
+
+    def _page_worker(self):
+        while True:
+            item = self._pages_q.get()
+            if item is None:
+                return
+            if item[0] == "done":
+                self.msg_queue.put(("scan_finished", item[1]))
+                continue
+            _k, ev, opts, feeder, dpi, deskew, skip_blank = item
+            # пустые страницы — забота автоподатчика; на стекле пустой
+            # лист значит, что сканировали не то, и это надо видеть
+            use_feeder = feeder if feeder is not None else opts.get("source") != "flatbed"
             try:
-                self.after(0, apply_ui)
+                res = finalize_scan_page(ev["path"], ScanSessionStore.DIR,
+                                         opts.get("color", "color"), deskew,
+                                         skip_blank and bool(use_feeder),
+                                         float(ev.get("dpi") or dpi or 0))
+            except Exception as e:
+                _log_exc("scan page", e)
+                res = {"path": None, "blank": False, "angle": 0.0,
+                       "error": str(e)[:120]}
+            self.msg_queue.put(("scan_page_ready", res))
+
+    def _add_scanned_page(self, res: dict):
+        info = self._job_info
+        if res.get("blank"):
+            info["blank"] = info.get("blank", 0) + 1
+            self._log("◌ " + t("scan_blank_skipped"))
+            return
+        path = res.get("path")
+        if not path:
+            if res.get("error"):
+                self._log("✗ " + res["error"])
+            return
+        if abs(res.get("angle") or 0) >= 0.2:
+            info["straight"] = info.get("straight", 0) + 1
+        info["added"] = info.get("added", 0) + 1
+        self.pages.append(path)
+        ScanSessionStore.save(self.pages)
+        try:
+            self._make_page_card(len(self.pages) - 1, path)
+            self.pages_count.configure(text=str(len(self.pages)))
+            self.pages_hint.place_forget()
+            self.after(30, lambda: self.pages_area._parent_canvas.yview_moveto(1.0))
+        except Exception as e:
+            _log_exc("scan page card", e)
+        self._log(f"✓ {t('scan_page_n').format(n=len(self.pages))}")
+
+    def _finish_scan(self, ev: dict):
+        info = self._job_info
+        self._job = None
+        self.is_running = False
+        # Неопределённый прогресс гасим здесь же, а не через очередь:
+        # сообщение из очереди пришло бы после итога и обнулило полосу.
+        if self._busy:
+            self._busy = False
+            try:
+                self.progress.stop()
             except Exception:
                 pass
+            self.progress.configure(mode="determinate")
+        try:
+            self.scan_btn.configure(text=t("scan_btn"))
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(info.get("out", ""), ignore_errors=True)
+        except Exception:
+            pass
+        added, blank, straight = info.get("added", 0), info.get("blank", 0), \
+            info.get("straight", 0)
+        parts = [t("scan_done_n").format(n=added)]
+        if blank:
+            parts.append(t("scan_blank_n").format(n=blank))
+        if straight:
+            parts.append(t("scan_straight_n").format(n=straight))
+        summary = "  ·  ".join(parts)
+        err = info.get("error")
+        if err:
+            text = self._error_text(err)
+            if added:
+                text += "\n" + t("scan_kept_n").format(n=added)
+            self._set_status(t("error"), CLR_ERR)
+            self.progress.set(0)
+            self.show_toast(text, "err", timeout=10000)
+        elif ev.get("cancelled"):
+            self._set_status(t("stopped"), CLR_WARN)
+            self.progress.set(0)
+            self.show_toast(t("scan_cancelled") + (f"  ·  {summary}" if added else ""),
+                            "warn")
+        else:
+            self._set_status(t("ready"), CLR_MUTED)
+            self.progress.set(1.0)
+            kind = "warn" if (info.get("warnings") or (not added and not blank)) else "ok"
+            text = summary
+            if info.get("warnings"):
+                text += "\n" + info["warnings"][-1]
+            if not added and not blank:
+                text = t("scan_no_pages_came")
+            self.show_toast(text, kind)
+            if added and load_settings().get("sound", True):
+                play_sound()
+        self._log(summary)
 
-        threading.Thread(target=work, daemon=True).start()
+    def _error_text(self, ev: dict) -> str:
+        code = ev.get("code") or "driver_error"
+        key = "scan_err_" + code
+        table = TRANSLATIONS.get(LANG, TRANSLATIONS["ru"])
+        text = table.get(key) or table.get("scan_err_driver_error", code)
+        detail = (ev.get("detail") or "").strip()
+        if code in ("driver_error", "internal", "device_open_failed") and detail:
+            text += f" ({detail[:90]})"
+        return text
 
-    def _selected_device_key(self):
-        sel = self.dev_list.curselection()
-        if not sel or not self.devices_cache:
-            return "dialog"
-        idx = sel[0]
-        if 0 <= idx < len(self.devices_cache):
-            return self.devices_cache[idx][0]
-        return "dialog"
-
-    def _tmp_scan_path(self, ext=".png") -> str:
-        TEMP_DIR.mkdir(parents=True, exist_ok=True)
-        return str(TEMP_DIR / f"scan_{time.time_ns()}{ext}")
+    # --------------------------------------------------------------- pages
 
     def _ingest_file(self, path: str) -> list:
-        """Добавить файл; многостраничный TIFF разбить на страницы."""
+        """Добавить картинку; многостраничный TIFF разбить на страницы."""
         added = []
         path = str(path)
         if not os.path.isfile(path):
             return added
-        ext = Path(path).suffix.lower()
-        if ext in (".tif", ".tiff"):
+        if Path(path).suffix.lower() in (".tif", ".tiff"):
             try:
                 with Image.open(path) as im:
                     n = getattr(im, "n_frames", 1)
-                    for i in range(n):
-                        try:
-                            im.seek(i)
-                            frame = im.convert("RGB")
-                            out = self._tmp_scan_path(".png")
-                            frame.save(out)
-                            self.pages.append(out)
-                            added.append(out)
-                        except Exception as e:
-                            _log_exc("tiff frame", e)
-                if str(TEMP_DIR) in path:
-                    try:
-                        os.unlink(path)
-                    except Exception:
-                        pass
-                return added
+                    if n > 1:
+                        for i in range(n):
+                            try:
+                                im.seek(i)
+                                dpi = (im.info.get("dpi") or (0, 0))[0]
+                                frame = im.convert("1") if im.mode == "1" else \
+                                    im.convert("L" if im.mode in ("L", "I;16") else "RGB")
+                                out = save_page_image(
+                                    frame, str(ScanSessionStore.DIR /
+                                               f"page_{time.time_ns()}"), dpi)
+                                self.pages.append(out)
+                                added.append(out)
+                            except Exception as e:
+                                _log_exc("tiff frame", e)
+                        return added
             except Exception as e:
                 _log_exc("tiff ingest", e)
         self.pages.append(path)
@@ -5735,41 +6452,14 @@ class ScanSection(BaseSection):
     def add_paths(self, paths: List[str]):
         """DnD: перетащенные картинки становятся страницами."""
         added = 0
+        ScanSessionStore.DIR.mkdir(parents=True, exist_ok=True)
         for p in paths:
             for f in collect_files(p, IMAGE_EXTS, False):
                 added += len(self._ingest_file(f))
         if added:
+            ScanSessionStore.save(self.pages)
             self._refresh_pages_ui()
             self._log(f"+ {added}")
-
-    def _scan_page(self):
-        if self.is_running:
-            return
-        self.is_running = True
-        self.status.configure(text=t("scanning"), text_color=CLR_WARN)
-        key = self._selected_device_key()
-        devices = list(self.devices_cache)
-
-        self.msg_queue.put(("busy", True))
-
-        def work():
-            try:
-                out = self._tmp_scan_path(".png")
-                ok, result = scan_acquire(key, devices, out, 200)
-                if not ok:
-                    self.msg_queue.put(("busy", False))
-                    self.msg_queue.put(("log", f"✗ {result}"))
-                    self.msg_queue.put(("progress", 0, t("ready")))
-                    return
-                added = self._ingest_file(result)
-                self.msg_queue.put(("busy", False))
-                self.msg_queue.put(("log", f"✓ +{len(added)} ({len(self.pages)})"))
-                self.msg_queue.put(("scan_refresh", None))
-                self.msg_queue.put(("progress", 1, t("ready")))
-            finally:
-                self.is_running = False
-
-        threading.Thread(target=work, daemon=True).start()
 
     def _page_cols(self) -> int:
         try:
@@ -5784,7 +6474,6 @@ class ScanSection(BaseSection):
 
     def _on_pages_resize(self, _e=None):
         # при ресайзе карточки НЕ пересоздаются — только переставляются
-        # (re-grid): плавно, без фризов и мигания миниатюр
         cols = self._page_cols()
         if cols != self._page_cols_cur and self.pages:
             if self._resize_job:
@@ -5823,7 +6512,6 @@ class ScanSection(BaseSection):
         for idx, p in enumerate(self.pages):
             self._make_page_card(idx, p)
         self.pages_count.configure(text=str(len(self.pages)))
-        self.status.configure(text=t("ready"), text_color=CLR_MUTED)
         try:
             if self.pages:
                 self.pages_hint.place_forget()
@@ -5894,18 +6582,12 @@ class ScanSection(BaseSection):
         if not d["path"]:
             return
         if not d["moved"]:
-            # клик — переключить выбор
             if path in self._page_sel:
                 self._page_sel.discard(path)
             else:
                 self._page_sel.add(path)
-            cd = self._page_cards.get(path)
-            if cd:
-                cd["card"].configure(
-                    border_color=(CLR_ACC if path in self._page_sel
-                                  else CLR_ROW))
+            self._paint_selection(path)
             return
-        # перетаскивание — найти карточку под курсором
         target = None
         try:
             w = self.winfo_containing(e.x_root, e.y_root)
@@ -5920,13 +6602,57 @@ class ScanSection(BaseSection):
         if target and target != d["path"]:
             self._reorder_pages(d["path"], target)
 
+    def _paint_selection(self, path):
+        cd = self._page_cards.get(path)
+        if cd:
+            cd["card"].configure(border_color=(CLR_ACC if path in self._page_sel
+                                               else CLR_ROW))
+
+    def _select_all_pages(self):
+        if self.pages and len(self._page_sel) == len(self.pages):
+            self._page_sel.clear()
+        else:
+            self._page_sel = set(self.pages)
+        for p in self.pages:
+            self._paint_selection(p)
+
     def _reorder_pages(self, src: str, target: str):
         try:
             self.pages.remove(src)
             self.pages.insert(self.pages.index(target), src)
         except ValueError:
             return
+        ScanSessionStore.save(self.pages)
         self._relayout_pages()  # без пересоздания — мгновенно
+
+    def _rotate_selected(self, degrees: int):
+        targets = [p for p in self.pages if p in self._page_sel]
+        if not targets:
+            self.show_toast(t("select_pages_first"), "warn")
+            return
+        if self.is_running:
+            return
+
+        def work():
+            mapping = {}
+            for p in targets:
+                try:
+                    mapping[p] = rotate_page_file(p, degrees, ScanSessionStore.DIR)
+                except Exception as e:
+                    _log_exc("rotate page", e)
+            self.msg_queue.put(("scan_rotated", mapping))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_rotation(self, mapping: dict):
+        if not mapping:
+            return
+        self.pages = [mapping.get(p, p) for p in self.pages]
+        self._page_sel = {mapping.get(p, p) for p in self._page_sel}
+        for old in mapping:
+            self._thumb_cache.pop(old, None)
+        ScanSessionStore.save(self.pages)
+        self._refresh_pages_ui()
 
     def _remove(self):
         # Del в сканере работает со страницами, а не с self.files
@@ -5939,52 +6665,34 @@ class ScanSection(BaseSection):
         if not self._page_sel:
             return
         for p in list(self._page_sel):
-            try:
-                if str(TEMP_DIR) in os.path.abspath(p):
+            if ScanSessionStore.owns(p):
+                try:
                     os.unlink(p)
-            except Exception:
-                pass
+                except OSError:
+                    pass
             if p in self.pages:
                 self.pages.remove(p)
+            self._thumb_cache.pop(p, None)
         self._page_sel.clear()
+        ScanSessionStore.save(self.pages)
         self._refresh_pages_ui()
 
     def _clear_pages(self):
         if self.pages and not messagebox.askyesno(APP_NAME, t("clear_pages_q")):
             return
         for p in self.pages:
-            try:
-                if os.path.isfile(p) and str(TEMP_DIR) in os.path.abspath(p):
+            if ScanSessionStore.owns(p):
+                try:
                     os.unlink(p)
-            except Exception:
-                pass
+                except OSError:
+                    pass
         self.pages.clear()
         self._page_sel.clear()
+        self._thumb_cache.clear()
+        ScanSessionStore.save(self.pages)
         self._refresh_pages_ui()
 
-    def _cleanup_temps(self, silent=False):
-        removed = 0
-        for p in list(self.pages):
-            try:
-                if os.path.isfile(p) and str(TEMP_DIR) in os.path.abspath(p):
-                    os.unlink(p)
-                    removed += 1
-            except Exception:
-                pass
-        try:
-            if TEMP_DIR.is_dir():
-                for f in TEMP_DIR.glob("scan_*"):
-                    try:
-                        f.unlink()
-                        removed += 1
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        if not silent:
-            self.pages.clear()
-            self._refresh_pages_ui()
-            self._log(f"🗑 {removed}")
+    # ---------------------------------------------------------------- save
 
     def _preset_key(self) -> str:
         m = {
@@ -6010,8 +6718,11 @@ class ScanSection(BaseSection):
             self._log(f"⚠ {err} → {folder}")
         return folder
 
-    def _maybe_open(self, folder: str):
-        if self.open_after_var.get():
+    @staticmethod
+    def _maybe_open(folder: str, wanted: bool):
+        """Вызывается из фонового потока: значение галочки читается заранее,
+        в потоке интерфейса — Tk из чужого потока трогать нельзя."""
+        if wanted:
             try:
                 os.startfile(folder)
             except Exception:
@@ -6030,46 +6741,45 @@ class ScanSection(BaseSection):
             return
         self.is_running = True
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_pdf = str(Path(folder) / f"document_{now}.pdf")
+        out_pdf = unique_out_path(str(Path(folder) / f"document_{now}.pdf"))
         raw_pdf = str(TEMP_DIR / f"doc_raw_{now}.pdf")
         compress = self.compress_var.get()
         preset = self._preset_key()
         dpi = safe_int(self.comp_dpi.get(), 130, 50, 300)
-        quality = safe_int(self.comp_q.get(), 55, 20, 95)
+        quality = safe_int(self.comp_q.get(), 68, 20, 95)
         gray = self.gray_var.get()
         pages = list(self.pages)
+        open_after = bool(self.open_after_var.get())
 
         def work():
             try:
                 TEMP_DIR.mkdir(parents=True, exist_ok=True)
                 self.msg_queue.put(("log", f"→ PDF ({len(pages)})…"))
                 span = 0.5 if compress else 1.0
-                ok, msg, _added, _skipped = images_to_pdf(
+                ok, msg, _added, skipped = images_to_pdf(
                     pages, raw_pdf if compress else out_pdf,
                     progress_cb=lambda i, n: self.msg_queue.put(
                         ("progress", span * i / max(1, n), f"{i}/{n}")))
                 if not ok:
                     self.msg_queue.put(("log", f"✗ {tr_msg(msg)}"))
+                    self.msg_queue.put(("toast", tr_msg(msg), "err", None))
                     return
                 if compress:
                     _i, ok2, msg2, orig, new = process_pdf(
                         raw_pdf, out_pdf, preset, dpi, quality, gray,
                         progress_cb=lambda f: self.msg_queue.put(
-                            ("progress", 0.5 + 0.5 * f, f"{int(f * 100)}%")))
-                    if ok2:
-                        self.msg_queue.put(("log", f"✓ PDF: {out_pdf} ({new / 1024:.0f} KB)"))
-                    else:
-                        # сжатие не удалось/без выигрыша → исходник ещё на
-                        # месте, копируем его (документ не теряется)
-                        try:
-                            shutil.copy2(raw_pdf, out_pdf)
-                            self.msg_queue.put(("log", f"✓ PDF: {out_pdf}"))
-                        except Exception as e:
-                            _log_exc("scan pdf copy", e)
-                            self.msg_queue.put(("log", f"✗ {tr_msg(msg2)}"))
-                            return
-                else:
-                    self.msg_queue.put(("log", f"✓ PDF: {out_pdf}"))
+                            ("progress", 0.5 + 0.5 * f, f"{int(f * 100)}%")),
+                        threads=min(4, MAX_WORKERS))
+                    if not ok2:
+                        # сжатие без выигрыша → исходник ещё на месте
+                        shutil.copy2(raw_pdf, out_pdf)
+                size = os.path.getsize(out_pdf)
+                self.msg_queue.put(("log", f"✓ PDF: {out_pdf} ({size / 1024:.0f} KB)"))
+                text = f"{t('pdf_created')} {os.path.basename(out_pdf)}  ·  " \
+                       f"{human_size(size)}"
+                if skipped:
+                    text += f"  ·  ✗ {t('skipped_n').format(n=skipped)}"
+                self.msg_queue.put(("toast", text, "warn" if skipped else "ok", folder))
                 add_history({
                     "time": datetime.now().strftime("%d.%m %H:%M"),
                     "mode": "Scan→PDF",
@@ -6078,8 +6788,11 @@ class ScanSection(BaseSection):
                     "folder": folder,
                     "names": [os.path.basename(out_pdf)],
                 })
-                self._maybe_open(folder)
+                self._maybe_open(folder, open_after)
                 self.msg_queue.put(("progress", 1, t("done")))
+            except Exception as e:
+                _log_exc("scan save pdf", e)
+                self.msg_queue.put(("toast", str(e)[:160], "err", None))
             finally:
                 try:
                     if os.path.isfile(raw_pdf):
@@ -6105,22 +6818,21 @@ class ScanSection(BaseSection):
         self.is_running = True
         pages = list(self.pages)
         compress = self.compress_var.get()
-        base_q = safe_int(self.comp_q.get(), 55, 20, 95)
+        base_q = safe_int(self.comp_q.get(), 68, 20, 95)
         q = max(40, min(92, base_q + (0 if compress else 25)))
+        open_after = bool(self.open_after_var.get())
 
         def work():
             try:
                 ok_n = 0
                 stamp = datetime.now().strftime("%H%M%S")
                 for i, p in enumerate(pages, 1):
-                    out = str(Path(folder) / f"scan_{i:02d}_{stamp}.jpg")
-                    out = unique_out_path(out)
+                    out = unique_out_path(str(Path(folder) / f"scan_{i:02d}_{stamp}.jpg"))
                     ok = False
                     msg = ""
                     if compress:
                         _a, ok, msg, _o, _n = process_image(p, out, q, 0, "JPEG", True)
                         if not ok and msg == "err_no_gain":
-                            # без выигрыша — просто копируем страницу как JPG
                             ok = self._plain_jpg(p, out)
                     else:
                         ok = self._plain_jpg(p, out)
@@ -6132,6 +6844,8 @@ class ScanSection(BaseSection):
                     self.msg_queue.put(("progress", i / len(pages),
                                         f"{i}/{len(pages)}"))
                 self.msg_queue.put(("log", f"JPG: {ok_n}/{len(pages)} → {folder}"))
+                self.msg_queue.put(("toast", f"JPG: {ok_n}/{len(pages)}",
+                                    "ok" if ok_n == len(pages) else "warn", folder))
                 add_history({
                     "time": datetime.now().strftime("%d.%m %H:%M"),
                     "mode": "Scan→files",
@@ -6139,7 +6853,7 @@ class ScanSection(BaseSection):
                     "saved_mb": 0,
                     "folder": folder,
                 })
-                self._maybe_open(folder)
+                self._maybe_open(folder, open_after)
             finally:
                 self.is_running = False
 
@@ -6150,7 +6864,7 @@ class ScanSection(BaseSection):
         try:
             with Image.open(src) as im0:
                 im = ImageOps.exif_transpose(im0)
-                if im.mode in ("RGBA", "P", "LA"):
+                if im.mode not in ("L", "RGB"):
                     im = im.convert("RGB")
                 im.save(out, "JPEG", quality=92, optimize=True)
             return True
@@ -6158,34 +6872,62 @@ class ScanSection(BaseSection):
             _log_exc("plain jpg", e)
             return False
 
+    # ------------------------------------------------------------ settings
+
+    @staticmethod
+    def _label_for(mapping: dict, value, default_label: str) -> str:
+        return next((lb for lb, v in mapping.items() if v == value), default_label)
+
     def _apply(self):
         s = self.settings
         self.compress_var.set(bool(s.get("scan_compress", True)))
         self.pdf_preset_var.set(s.get("scan_pdf_preset") or t("smart_pdf"))
         self.comp_dpi.set(str(safe_int(s.get("scan_comp_dpi"), 130, 50, 300)))
-        self.comp_q.set(str(safe_int(s.get("scan_comp_q"), 55, 20, 95)))
+        self.comp_q.set(str(safe_int(s.get("scan_comp_q"), 68, 20, 95)))
         self.gray_var.set(bool(s.get("scan_gray", False)))
         self.open_after_var.set(bool(s.get("scan_open_folder", True)))
         if s.get("scan_folder"):
             self.folder_var.set(s["scan_folder"])
+        self.ui_var.set(bool(s.get("scan_use_ui", False)))
+        self.src_var.set(self._label_for(self._src_map, s.get("scan_source"),
+                                         t("scan_src_flatbed")))
+        self.col_var.set(self._label_for(self._col_map, s.get("scan_color"),
+                                         t("scan_col_color")))
+        self.dpi_var.set(self._label_for(self._dpi_map, safe_int(s.get("scan_dpi"), 300),
+                                         "300 dpi"))
+        self.pap_var.set(self._label_for(self._pap_map, s.get("scan_paper"), "A4"))
+        self.deskew_var.set(bool(s.get("scan_deskew", True)))
+        self.blank_var.set(bool(s.get("scan_skip_blank", True)))
         self._toggle_comp_ui()
+        self._toggle_ui_mode()
 
     def _collect(self) -> dict:
         s = load_settings()
+        opts = self._scan_opts()
         s.update({
             "scan_compress": self.compress_var.get(),
             "scan_pdf_preset": self.pdf_preset_var.get(),
             "scan_comp_dpi": safe_int(self.comp_dpi.get(), 130, 50, 300),
-            "scan_comp_q": safe_int(self.comp_q.get(), 55, 20, 95),
+            "scan_comp_q": safe_int(self.comp_q.get(), 68, 20, 95),
             "scan_gray": self.gray_var.get(),
             "scan_folder": self.folder_var.get(),
             "scan_open_folder": self.open_after_var.get(),
+            "scan_use_ui": opts["ui"],
+            "scan_source": opts["source"],
+            "scan_color": opts["color"],
+            "scan_dpi": opts["dpi"],
+            "scan_paper": opts["paper"],
+            "scan_deskew": self.deskew_var.get(),
+            "scan_skip_blank": self.blank_var.get(),
             "theme": ctk.get_appearance_mode(),
         })
+        dev = self._selected_device() if hasattr(self, "dev_list") else None
+        if dev is not None:
+            s["scan_device"] = dev.key
         return s
 
     def _start(self):
-        self._scan_page()
+        self._scan()
 
 
 class HistorySection(ctk.CTkFrame):

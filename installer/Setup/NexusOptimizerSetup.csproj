@@ -2,10 +2,23 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <!-- .NET Framework 4.6.2 ships with Windows itself: Windows 10 from 1607
+         (including the LTSC 2016/2019 builds common on office PCs) and every
+         Windows 11. A modern .NET target looked tidier but made Windows 10 ask
+         the user to download a runtime before the installer could even open. -->
+    <TargetFramework>net462</TargetFramework>
+    <LangVersion>latest</LangVersion>
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- 64-bit process on 64-bit Windows: Program Files and the registry are
+         then the real ones, not the WOW64 redirections. -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <!-- Without its own manifest a .NET Framework program is told by Windows
+         that it runs on Windows 8 (6.2.9200), and the Windows 11 24H2 check
+         for the system-wide Explorer menu would never fire. -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>NexusOptimizerSetup</AssemblyName>
     <RootNamespace>NexusOptimizer.Setup</RootNamespace>
     <ApplicationIcon>..\Assets\app.ico</ApplicationIcon>
@@ -14,9 +27,16 @@
     <Copyright>Copyright (c) 2026 Artur Yurchuk</Copyright>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <DebugType>embedded</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <!-- build_installer.ps1 passes -p:Version and -p:MsiPath. Without MsiPath a
          development build is produced that reports the missing package. -->
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- System.Net.Http is not referenced on .NET Framework, and nothing here
+         uses it. -->
+    <Using Remove="System.Net.Http" />
+  </ItemGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="$(MsiPath)" Condition="'$(MsiPath)' != ''"

@@ -28,16 +28,18 @@ Everything else is permissive and imposes no further conditions.
 | pillow-heif / libheif | 1.5.0 | HEIC/HEIF/AVIF photos | BSD-3-Clause (libheif: LGPL-3.0) |
 | CustomTkinter | 5.2.2 | interface widgets | CC0-1.0 |
 | tkinterdnd2 / tkdnd | 0.4.4.1 | drag and drop | MIT |
-| comtypes | 1.4.16 | WIA scanning, shortcuts | MIT |
+| comtypes | 1.4.16 | Explorer shortcuts | MIT |
 | darkdetect | 0.8.0 | following the Windows theme | BSD-3-Clause |
 | lxml | 6.1.1 | XMP metadata (via pikepdf) | BSD-3-Clause |
 | Python | 3.13 | runtime | PSF-2.0 |
 
-## TWAIN
+## Scanning: WIA and TWAIN
 
-TWAIN support is a first-party implementation in `NexusPDFOptimizer.py`: a
-direct `ctypes` binding to `twaindsm.dll`, written against the public TWAIN
-specification. It carries no third-party code and therefore no third-party
+Scanning is done by the program's own worker, `NexusScan64.exe` and
+`NexusScan32.exe` (`scanner/NexusScan`, C# on .NET Framework 4.6.2, which is
+part of Windows). Its TWAIN code is written against the public TWAIN
+specification and its WIA code uses the WIA automation library that ships with
+Windows. It carries no third-party code and therefore no third-party
 conditions.
 
 Earlier versions used the `pytwain` package, which is distributed strictly
@@ -45,23 +47,25 @@ under **GPL-2.0** with no "or later" clause. GPL-2.0-only cannot be combined
 with AGPL-3.0 (PyMuPDF) or GPL-3.0 (FFmpeg), so shipping it alongside them was
 not permitted. Replacing it removed the conflict and kept the feature.
 
-`twaindsm.dll` — the TWAIN Data Source Manager — is shipped alongside the
-program and loaded dynamically. It is **not** modified in any way.
+`TWAINDSM.dll` — the TWAIN Data Source Manager — is shipped in both bitnesses
+next to the worker (`scan\x64`, `scan\x86`) and loaded dynamically. Neither
+file is modified in any way.
 
-| Item | Value |
-| --- | --- |
-| Version | 2.5.1.0, x64 |
-| Licence | LGPL-2.1-or-later |
-| Publisher | TWAIN Working Group (Authenticode signature verified) |
-| Source | <https://github.com/twain/twain-dsm> |
-| Release | <https://github.com/twain/twain-dsm/releases/tag/v2.5.1>, `dsm_020501.zip` |
-| SHA-256 | `25869F88A2BC76DED62A13AAEA9F2084F0165BFDBBB7F46B9C3A43298938D467` |
+| Item | x64 | x86 |
+| --- | --- | --- |
+| Version | 2.5.1.0 | 2.5.1.0 |
+| SHA-256 | `25869F88A2BC76DED62A13AAEA9F2084F0165BFDBBB7F46B9C3A43298938D467` | `CEE9A6FF8026DDE09EDA9F892C57CC928D42E4A4D22BB740FE38EE6E91797A28` |
+| Licence | LGPL-2.1-or-later | LGPL-2.1-or-later |
+| Publisher | TWAIN Working Group (Authenticode signature verified) | same |
+| Source | <https://github.com/twain/twain-dsm> | same |
+| Release | <https://github.com/twain/twain-dsm/releases/tag/v2.5.1>, `dsm_020501.zip` | same archive |
 
-It is bundled because a 64-bit DSM is not present on every Windows machine —
-without it TWAIN finds no scanners at all. LGPL-2.1-or-later permits the
+They are bundled because a 64-bit manager is not part of Windows, and a 32-bit
+one is installed only by some scanner drivers. LGPL-2.1-or-later permits the
 upgrade to LGPL-3.0, which is compatible with AGPL-3.0, and the library is used
 through dynamic loading, so it may be replaced by the user with any other build
-of the same manager.
+of the same manager. Provenance and the update procedure:
+[scanner/twain/README.md](scanner/twain/README.md).
 
 ## Source code for the GPL components
 
