@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from PIL import Image, ImageOps, ImageStat
-from nexus_support import AtomicOutput, ProcessingCancelled, paths_alias
+from nexus_support import AtomicOutput, ProcessingCancelled, paths_alias, available_memory
 
 
 def _image_ok(path, expected_size):
@@ -48,8 +48,11 @@ def compress_image(ctx, inp, out, quality, max_side, fmt, smart, effort="balance
             # JPEG decoder reduction happens before a full raster is allocated.
             if maximum and original.format == "JPEG":
                 original.draft(original.mode, (maximum, maximum))
+            if original.width * original.height * 12 > available_memory() * 0.65:
+                return inp, False, "err_image_memory", orig, orig
             image = ImageOps.exif_transpose(original)
             image.load()
+        original.close()
         angle = ctx.ScanSessionStore.rotation(inp)
         operation = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
                      270: Image.Transpose.ROTATE_270}.get(angle)
@@ -70,11 +73,23 @@ def compress_image(ctx, inp, out, quality, max_side, fmt, smart, effort="balance
             background = Image.new("RGB", rgba.size, "white")
             background.paste(rgba, mask=rgba.getchannel("A"))
             image = background
+        elif image.mode in ("P", "PA", "LA"):
+            if fmt != "PNG" or image.mode == "PA":
+                image = image.convert("RGBA" if image.mode in ("PA", "LA") or "transparency" in image.info else "RGB")
+        elif image.mode in ("I", "I;16", "I;16L", "I;16B", "F"):
+            if fmt != "PNG" or image.mode == "F" or not (0 <= image.getextrema()[0] <= image.getextrema()[1] <= 65535):
+                return inp, False, "err_bit_depth", orig, orig
+            image = image.convert("I;16")
         elif image.mode not in ("RGB", "L", "RGBA"):
             image = image.convert("RGB")
         if maximum and max(image.size) > maximum:
-            image.thumbnail((maximum, maximum), Image.Resampling.LANCZOS, reducing_gap=2.0)
-        small = image.convert("RGB").resize((48, 48), Image.Resampling.BILINEAR) if smart else None
+            if image.mode == "I;16":
+                image = image.convert("I")
+                image.thumbnail((maximum, maximum), Image.Resampling.BILINEAR)
+                image = image.convert("I;16")
+            else:
+                image.thumbnail((maximum, maximum), Image.Resampling.LANCZOS, reducing_gap=2.0)
+        small = image.convert("RGBA").convert("RGB").resize((48, 48), Image.Resampling.BILINEAR) if smart else None
         photo_like = not smart or sum(ImageStat.Stat(small).stddev) > 42 or (small.getcolors(600) is None)
         q = max(15, min(95, ctx.safe_int(quality, 75)))
         if smart and not photo_like and fmt == "JPEG":

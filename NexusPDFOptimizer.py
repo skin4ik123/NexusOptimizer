@@ -939,7 +939,7 @@ TRANSLATIONS = {
         "scan_deskew": "Выравнивать перекошенные страницы",
         "scan_skip_blank": "Пропускать пустые листы (автоподатчик)",
         "scan_select_all": "Выбрать все",
-        "scan_help": "1) Выберите сканер и параметры слева\n2) «Сканировать» — страницы появляются по мере сканирования\n3) Щелчок выбирает страницу, перетаскивание меняет порядок, ↺ ↻ поворачивают\n4) Сохраните одним PDF или картинками JPG. Страницы не пропадут до «Очистить список»",
+        "scan_help": "1) Выберите сканер и параметры слева\n2) «Сканировать» — страницы появляются по мере сканирования\n3) Щелчок выбирает страницу, перетаскивание меняет порядок, ↺ ↻ поворачивают\n4) Сохраните одним PDF или картинками JPG. Экспортируйте нужные страницы перед закрытием",
         "scan_searching": "Поиск сканеров…",
         "scan_found": "Найдено сканеров: {n}",
         "scan_no_devices": "Сканеры не найдены. Включите сканер, проверьте кабель или сеть и нажмите «Обновить список».",
@@ -957,7 +957,7 @@ TRANSLATIONS = {
         "scan_cancelled": "Сканирование остановлено",
         "scan_blank_skipped": "пустой лист пропущен",
         "scan_no_pages_came": "Сканер не прислал ни одной страницы",
-        "scan_restored": "Страницы с прошлого раза на месте: {n}",
+        "scan_restored": "Восстановлены страницы незавершённого сеанса: {n}",
         "select_pages_first": "Сначала выберите страницы — щелчком по ним",
         "scan_warn_ui_required": "Этот сканер работает только через своё окно — оно открыто.",
         "scan_warn_no_duplex": "Сканер не умеет сканировать обе стороны — отсканирована одна.",
@@ -1182,7 +1182,7 @@ TRANSLATIONS = {
         "scan_deskew": "Straighten skewed pages",
         "scan_skip_blank": "Skip blank sheets (feeder)",
         "scan_select_all": "Select all",
-        "scan_help": "1) Pick a scanner and settings on the left\n2) Scan — pages appear as they are scanned\n3) Click selects a page, drag reorders, ↺ ↻ rotate\n4) Save as one PDF or as JPG images. Pages stay until Clear list",
+        "scan_help": "1) Pick a scanner and settings on the left\n2) Scan — pages appear as they are scanned\n3) Click selects a page, drag reorders, ↺ ↻ rotate\n4) Save as one PDF or as JPG images. Export the pages you want to keep before closing",
         "scan_searching": "Looking for scanners…",
         "scan_found": "Scanners found: {n}",
         "scan_no_devices": "No scanners found. Turn the scanner on, check the cable or network and click Refresh list.",
@@ -1200,7 +1200,7 @@ TRANSLATIONS = {
         "scan_cancelled": "Scanning stopped",
         "scan_blank_skipped": "blank sheet skipped",
         "scan_no_pages_came": "The scanner sent no pages",
-        "scan_restored": "Pages from last time are still here: {n}",
+        "scan_restored": "Recovered pages from an interrupted session: {n}",
         "select_pages_first": "Select pages first — click on them",
         "scan_warn_ui_required": "This scanner only works through its own window — it is open.",
         "scan_warn_no_duplex": "The scanner cannot scan both sides — one side was scanned.",
@@ -1733,6 +1733,8 @@ def ffmpeg_encoders() -> frozenset:
             if m:
                 names.add(m.group(1))
         return frozenset(names)
+    except ProcessingCancelled:
+        raise
     except Exception as e:
         _log_exc("ffmpeg encoders", e)
         return frozenset()
@@ -1789,6 +1791,8 @@ def probe_hw_encoder(enc: str) -> bool:
             timeout=25)
         ok = r.returncode == 0
         log.info("hw probe %s: %s", enc, "OK" if ok else "unavailable")
+    except ProcessingCancelled:
+        raise
     except Exception as e:
         _log_exc(f"hw probe {enc}", e)
         return False
@@ -1852,6 +1856,8 @@ def _probe_duration(ff: str, inp: str) -> float:
         mm = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", err)
         if mm:
             return int(mm.group(1)) * 3600 + int(mm.group(2)) * 60 + float(mm.group(3))
+    except ProcessingCancelled:
+        raise
     except Exception as e:
         _log_exc("probe duration", e)
     return 0.0
@@ -2102,6 +2108,7 @@ def cleanup_stale_temp():
         try:
             if match and not process_alive(int(match.group(1))):
                 cleanup_stage_journal(item)
+                recover_received_scans(item)
                 remove_owned_tree(item)
             elif not match and item.stat().st_mtime < time.time() - 86400:
                 if item.is_dir():
@@ -2110,6 +2117,20 @@ def cleanup_stale_temp():
                     item.unlink(missing_ok=True)
         except OSError:
             continue
+
+
+def recover_received_scans(run_dir):
+    """Keep a received raster if the app crashed before preprocessing began."""
+    for folder in Path(run_dir).glob("scanjob_*"):
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        for received in folder.glob("page_*"):
+            if received.is_symlink() or received.suffix.lower() not in (".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+                continue
+            original = ScanSessionStore.DIR / ("raw_recovered_" + uuid.uuid4().hex + received.suffix)
+            copy_atomic(received, original, TEMP_DIR)
+            ScanSessionStore.recover_page(str(original), "interrupted")
+            received.unlink()
 
 
 def cleanup_batch_temp():
@@ -2927,6 +2948,8 @@ def finalize_scan_page(src: str, dst_dir: Path, want_color: str, deskew: bool,
             im0.load()
             info_dpi = im0.info.get("dpi")
             im = ImageOps.exif_transpose(im0)
+        # ImageFile.__exit__ closes fp, but BMP can still hold a Windows mmap.
+        im0.close()
         dpi = float(dpi_hint or 0)
         try:
             if info_dpi and float(info_dpi[0]) >= 50:
@@ -3466,8 +3489,11 @@ def _pdf_output_ok(path: str, pages_expected: int, source: str = None) -> bool:
                             return False
                         # Rendering both files catches an otherwise valid blank
                         # or black page after a failed image rewrite.
-                        a = before.get_pixmap(dpi=36, colorspace=fitz.csGRAY, alpha=False).samples
-                        b = after.get_pixmap(dpi=36, colorspace=fitz.csGRAY, alpha=False).samples
+                        zoom = min(0.5, 2048 / max(before.rect.width, before.rect.height,
+                                                  after.rect.width, after.rect.height))
+                        matrix = fitz.Matrix(zoom, zoom)
+                        a = before.get_pixmap(matrix=matrix, colorspace=fitz.csGRAY, alpha=False).samples
+                        b = after.get_pixmap(matrix=matrix, colorspace=fitz.csGRAY, alpha=False).samples
                         if a and b and max(a) - min(a) >= 16 and max(b) - min(b) < 4:
                             return False
             return True
@@ -3917,6 +3943,8 @@ class BaseSection(ctk.CTkFrame):
         def run():
             try:
                 target(*args)
+            except ProcessingCancelled:
+                pass
             except Exception as error:
                 _log_exc(name, error)
                 self.msg_queue.put(("error", str(error)[:160]))
@@ -7612,8 +7640,8 @@ class App(TkinterDnD.DnDWrapper, ctk.CTk):
 
 
 def main():
-    cleanup_stale_temp()
     ScanSessionStore.prepare()
+    cleanup_stale_temp()
     App().mainloop()
 
 

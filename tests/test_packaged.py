@@ -42,16 +42,18 @@ def main(executable):
                     result = nexus_workers.run_pdf(str(source), str(output), "custom", 130, 55,
                                                    False, progress.append)
                     assert result[1] and progress, result
-                    assert nx._pdf_output_ok(str(output), 12, str(source))
                     pid = nexus_workers._local.client.proc.pid
                     repeated = nexus_workers.run_pdf(str(source), str(output), "custom", 130, 55, False)
                     assert repeated[1] and nexus_workers._local.client.proc.pid == pid
-                    return pid
+                    return pid, output
                 futures = [executor.submit(work, index) for index in range(2)]
-                pids = {future.result(timeout=180) for future in futures}
+                results = [future.result(timeout=180) for future in futures]
+                pids = {pid for pid, output in results}
                 assert len(pids) == 2
                 processes = [client.proc for client in executor.clients]
             assert all(process.poll() == 0 for process in processes)
+            for pid, output in results:
+                assert nx._pdf_output_ok(str(output), 12, str(source))
             assert not list((root / "workers").glob("pdf-worker-*"))
             print("PASS test_windowed_packaged_workers_reuse_and_validation", flush=True)
 

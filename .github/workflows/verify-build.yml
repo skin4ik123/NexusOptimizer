@@ -158,5 +158,7 @@ jobs:
           cd ..
           version=$(python -c 'import re; print(re.search(r"APP_VERSION\s*=\s*\"([0-9.]+)\"", open("NexusPDFOptimizer.py", encoding="utf-8").read())[1])')
           tag="v$version"
-          gh release create "$tag" "delivered/NexusOptimizer-Setup-$version.exe" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Nexus Optimizer $version" --notes-file "CHANGELOG-$version.md" --draft
+          export NEXUS_RELEASE_VERSION="$version"
+          python -c 'from pathlib import Path; import os; version=os.environ.get("NEXUS_RELEASE_VERSION", "3.10.0"); text=Path("CHANGELOG-"+version+".md").read_text(); digest=Path("verification/artifacts/SHA256SUMS.txt").read_text().strip(); Path("release-notes.md").write_text(text+"\nSHA-256: `"+digest.split()[0]+"`\n")'
+          gh release create "$tag" "delivered/NexusOptimizer-Setup-$version.exe" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Nexus Optimizer $version" --notes-file release-notes.md --draft
           gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest

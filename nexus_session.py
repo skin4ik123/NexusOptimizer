@@ -211,6 +211,7 @@ class ScanStore:
                 original.draft("RGB", draft_size)
             image = ImageOps.exif_transpose(original)
             image.load()
+        original.close()  # BMP mmap also has to be released on Windows.
         angle = cls.rotation(path)
         operation = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
                      270: Image.Transpose.ROTATE_270}.get(angle)

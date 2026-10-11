@@ -53,6 +53,67 @@ def make_pdf(path, size=(1000, 1400), quality=96):
         document.save(path)
 
 
+def test_received_scan_survives_crash_before_processing_and_copy_failure():
+    with StoreFixture() as root:
+        saved = nx.TEMP_BASE
+        nx.TEMP_BASE = root / "runs"
+        dead = nx.TEMP_BASE / "run_99999999_abcd"
+        received = dead / "scanjob_fixture" / "page_0001.bmp"
+        received.parent.mkdir(parents=True)
+        photo((100, 140)).save(received)
+        original = received.read_bytes()
+        live = nx.TEMP_BASE / ("run_" + str(os.getpid()) + "_abcd")
+        live.mkdir()
+        (live / "keep").write_bytes(b"active instance")
+        copy = nx.copy_atomic
+        try:
+            nx.copy_atomic = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+            nx.cleanup_stale_temp()
+            assert received.read_bytes() == original
+            nx.copy_atomic = copy
+            nx.cleanup_stale_temp()
+            assert not dead.exists() and (live / "keep").read_bytes() == b"active instance"
+            recovery = nx.ScanSessionStore.recovery()
+            assert len(recovery) == 1 and recovery[0]["reason"] == "interrupted"
+            assert Path(recovery[0]["path"]).read_bytes() == original
+        finally:
+            nx.TEMP_BASE = saved
+            nx.copy_atomic = copy
+
+
+def test_palette_greyscale_alpha_and_16bit_png_are_preserved():
+    with StoreFixture() as root:
+        palette = Image.new("P", (240, 180))
+        palette.putpalette([0, 0, 0, 20, 80, 160, 240, 230, 200] + [0] * (768 - 9))
+        palette.putdata([(x // 12 + y // 10) % 3 for y in range(180) for x in range(240)])
+        palette.info["transparency"] = bytes([0, 128, 255])
+        source = root / "palette.png"
+        palette.save(source, compress_level=0)
+        output = root / "palette-small.png"
+        result = nx.process_image(str(source), str(output), 90, 0, "PNG", True)
+        assert result[1], result
+        with Image.open(output) as actual:
+            difference = ImageChops.difference(palette.convert("RGBA"), actual.convert("RGBA"))
+            assert all(channel.getbbox() is None for channel in difference.split())
+        webp = root / "palette.webp"
+        assert nx.process_image(str(source), str(webp), 90, 0, "WebP", False)[1]
+        with Image.open(webp) as actual:
+            assert actual.convert("RGBA").getchannel("A").tobytes() == palette.convert("RGBA").getchannel("A").tobytes()
+        alpha = Image.new("LA", (240, 180), (80, 123))
+        alpha.save(source, compress_level=0)
+        assert nx.process_image(str(source), str(output), 80, 0, "PNG", True)[1]
+        with Image.open(output) as actual:
+            assert actual.convert("RGBA").tobytes() == alpha.convert("RGBA").tobytes()
+        import struct
+        raster = Image.frombytes("I;16", (128, 90), struct.pack("<" + "H" * (128 * 90),
+                               *[x * 516 for y in range(90) for x in range(128)]))
+        raster.save(source, compress_level=0)
+        assert nx.process_image(str(source), str(output), 75, 0, "PNG", True)[1]
+        with Image.open(output) as actual:
+            assert list(actual.getdata()) == list(raster.getdata())
+        assert nx.process_image(str(source), str(root / "depth.jpg"), 75, 0, "JPEG", False)[2] == "err_bit_depth"
+
+
 def test_faint_ink_is_not_blank_or_erased_by_bw():
     image = Image.new("L", (800, 1100), 245)
     draw = ImageDraw.Draw(image)
