@@ -322,7 +322,8 @@ def pdf_preview(ctx, payload):
         for path in (original, output if result[1] else original):
             with ctx.fitz.open(path) as document:
                 page = document[0]
-                zoom = min(2.0, 2200 / max(page.rect.width, page.rect.height))
+                # Two worst-case RGB PNGs plus base64 fit the 32 MiB IPC budget.
+                zoom = min(2.0, 1800 / max(page.rect.width, page.rect.height))
                 pixels = page.get_pixmap(matrix=ctx.fitz.Matrix(zoom, zoom), alpha=False)
                 images.append(base64.b64encode(pixels.tobytes("png")).decode("ascii"))
         return {"images": images, "original_bytes": result[3], "new_bytes": result[4],

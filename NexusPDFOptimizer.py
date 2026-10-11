@@ -74,7 +74,7 @@ LOG_FILE = APPDATA_DIR / "nexus.log"
 # the program is built with PyMuPDF under the AGPL-3.0.
 PROJECT_SITE = "https://nexus.internetdeco.com/"
 PROJECT_SUPPORT = "https://nexus.internetdeco.com/#support"
-PROJECT_SOURCE = "https://github.com/skin4ik123/NexusOptimizer"
+PROJECT_SOURCE = f"https://github.com/skin4ik123/NexusOptimizer/tree/v{APP_VERSION}"
 
 
 def _early_lang() -> str:
@@ -6222,7 +6222,7 @@ class ScanSection(BaseSection):
                 self._recovery_window.restore_button.configure(state="normal")
         elif kind == "recovery_saved":
             self._recovery_busy = False
-            self.show_toast(t("restore_count").format(n=item[1]), "ok")
+            self.show_toast(t("saved_count").format(n=item[1]), "ok")
             if self._recovery_window is not None and self._recovery_window.winfo_exists():
                 self._recovery_window.save_button.configure(state="normal")
 
@@ -6649,7 +6649,8 @@ class ScanSection(BaseSection):
             for path in mapping.values():
                 card = self._page_cards.get(path)
                 if card:
-                    card["img"].configure(text="…", image=None)
+                    # Keep the live Tk image until its replacement arrives.
+                    # CTkLabel(image=None) does not clear the native image.
                     self._thumb_request(path, (92, 118), ("page", path))
 
     def _restore_original(self):
@@ -7545,6 +7546,11 @@ class App(TkinterDnD.DnDWrapper, ctk.CTk):
         self._saved_files.clear()
         self._sections.clear()
         self.current = None
+        for job in self.tk.call("after", "info"):
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
         self.destroy()
 
     # ---- Drag & Drop на уровне root ----

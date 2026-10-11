@@ -12,7 +12,7 @@ from pathlib import Path
 def scenario(name, root):
     # Every scenario runs in a new process, as a real reopening does.
     os.environ.update(APPDATA=str(root / "roaming"), LOCALAPPDATA=str(root / "local"), NEXUS_MULTI="1")
-    (root / "temp").mkdir(exist_ok=True)
+    (root / "temp").mkdir(parents=True, exist_ok=True)
     tempfile.tempdir = str(root / "temp")
     sys.argv = [sys.argv[0]]
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -130,6 +130,15 @@ def scenario(name, root):
         app.show("scan")
         section = app.current
         section._page_sel = {str(scan)}
+        assert pump(app, lambda: str(scan) in section._thumb_cache)
+        scan_bytes = scan.read_bytes()
+        for angle in (90, 180, 270, 0):
+            section._rotate_selected(90)
+            assert pump(app, lambda: not section._edit_busy and str(scan) in section._thumb_cache)
+            assert nx.ScanSessionStore.rotation(str(scan)) == angle
+            label = section._page_cards[str(scan)]["img"]
+            assert str(label._label.cget("image")) in app.tk.call("image", "names"), "Rotation left a deleted Tk image"
+        assert scan.read_bytes() == scan_bytes
         section._remove_pages()
         assert nx.ScanSessionStore.recovery()[0]["path"] == str(scan)
         section._show_recovery()
