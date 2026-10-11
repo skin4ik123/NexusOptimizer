@@ -7548,7 +7548,8 @@ class App(TkinterDnD.DnDWrapper, ctk.CTk):
         self.current = None
         for job in self.tk.call("after", "info"):
             try:
-                self.after_cancel(job)
+                # Leave command ownership with the widget that destroys it.
+                self.tk.call("after", "cancel", job)
             except Exception:
                 pass
         self.destroy()

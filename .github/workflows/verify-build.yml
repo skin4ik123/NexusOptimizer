@@ -153,6 +153,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          current=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/codex/nexusoptimizer-039-fixes" --jq '.object.sha')
+          if [[ "$current" != "$GITHUB_SHA" ]]; then
+            printf 'A newer commit is awaiting verification; this build will not be published.\n'
+            exit 0
+          fi
           cd delivered
           sha256sum --check ../verification/artifacts/SHA256SUMS.txt
           cd ..
