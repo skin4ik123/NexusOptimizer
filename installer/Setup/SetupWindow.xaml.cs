@@ -96,15 +96,21 @@ public partial class SetupWindow : Window
 
     private void OnBrowse(object sender, RoutedEventArgs e)
     {
-        var dialog = new Microsoft.Win32.OpenFolderDialog
+        string? start = null;
+        try
         {
-            Title = "Nexus Optimizer install folder",
-            InitialDirectory = Path.GetDirectoryName(PathBox.Text) ?? "",
-        };
-        if (dialog.ShowDialog(this) == true)
+            start = Path.GetDirectoryName(PathBox.Text);
+        }
+        catch (ArgumentException)
+        {
+            // a half-typed path: open the dialog at its default place
+        }
+
+        var folder = FolderPicker.Pick(this, "Nexus Optimizer install folder", start);
+        if (folder != null)
         {
             _pathEditedByUser = true;
-            PathBox.Text = Path.Combine(dialog.FolderName, "Nexus Optimizer");
+            PathBox.Text = Path.Combine(folder, "Nexus Optimizer");
         }
     }
 
@@ -270,13 +276,26 @@ public partial class SetupWindow : Window
             if (_lastError != null) report += Environment.NewLine + _lastError;
             if (_lastLogPath != null && File.Exists(_lastLogPath))
                 report += Environment.NewLine + "--- msiexec log (tail) ---" + Environment.NewLine +
-                          string.Join(Environment.NewLine, File.ReadLines(_lastLogPath).TakeLast(80));
+                          string.Join(Environment.NewLine, Tail(_lastLogPath, 80));
             Clipboard.SetText(report);
         }
         catch
         {
             // the clipboard is busy: not important
         }
+    }
+
+    /// <summary>The last lines of a text file (Enumerable.TakeLast is not on .NET Framework).</summary>
+    private static IEnumerable<string> Tail(string path, int count)
+    {
+        var lines = new Queue<string>(count);
+        foreach (var line in File.ReadLines(path))
+        {
+            if (lines.Count == count)
+                lines.Dequeue();
+            lines.Enqueue(line);
+        }
+        return lines;
     }
 
     private void OnLaunch(object sender, RoutedEventArgs e)

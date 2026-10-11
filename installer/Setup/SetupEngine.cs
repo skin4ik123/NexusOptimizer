@@ -77,13 +77,13 @@ public sealed class SetupOptions
             else if (arg.Equals("/nomenu", StringComparison.OrdinalIgnoreCase))
                 options.ContextMenu = false;
             else if (arg.StartsWith("/dir=", StringComparison.OrdinalIgnoreCase))
-                options.CustomDir = arg[5..].Trim('"');
+                options.CustomDir = arg.Substring(5).Trim('"');
         }
         return options;
     }
 
     public string EffectiveInstallDir =>
-        string.IsNullOrWhiteSpace(CustomDir) ? DefaultInstallDir(AllUsers) : CustomDir;
+        CustomDir is string dir && !string.IsNullOrWhiteSpace(dir) ? dir : DefaultInstallDir(AllUsers);
 
     public static string DefaultInstallDir(bool allUsers) => allUsers
         ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Nexus Optimizer")
@@ -109,8 +109,8 @@ public static class SetupEngine
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
         if (string.IsNullOrWhiteSpace(informational))
             return Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "";
-        var plus = informational.IndexOf('+');
-        return plus > 0 ? informational[..plus] : informational;
+        var plus = informational!.IndexOf('+');
+        return plus > 0 ? informational.Substring(0, plus) : informational;
     }
 
     /// <summary>Extracts the embedded MSI to a temporary folder.</summary>
@@ -204,7 +204,9 @@ public static class SetupEngine
         {
             using var process = Process.Start(psi)
                 ?? throw new InvalidOperationException("Could not start msiexec.");
-            await process.WaitForExitAsync();
+            // WaitForExitAsync does not exist on .NET Framework; a blocking
+            // wait on a pool thread keeps the window responsive all the same.
+            await Task.Run(() => process.WaitForExit());
             return new InstallResult(process.ExitCode, logPath);
         }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
@@ -236,8 +238,8 @@ public static class SetupEngine
             {
                 using var key = root.OpenSubKey(
                     @"Software\Microsoft\Windows\CurrentVersion\Uninstall\" + LegacyAppId);
-                var raw = key?.GetValue("UninstallString") as string;
-                if (string.IsNullOrWhiteSpace(raw)) continue;
+                if (key?.GetValue("UninstallString") is not string raw || string.IsNullOrWhiteSpace(raw))
+                    continue;
                 var path = raw.Trim().Trim('"');
                 if (File.Exists(path)) return path;
             }

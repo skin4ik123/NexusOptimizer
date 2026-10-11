@@ -1,22 +1,13 @@
-# Сборки и окружение. Каталоги ниже занимают около 800 МБ и полностью
-# воспроизводятся из исходников — в репозитории им делать нечего.
+__pycache__/
+*.py[cod]
 .venv/
 build/
 dist/
 artifacts/
-__pycache__/
-*.pyc
-*.pyo
-
-# Результаты работы PyInstaller и WiX
-*.wixpdb
-*.wixobj
-installer/Setup/bin/
-installer/Setup/obj/
-
-# Локальные файлы среды
-.vscode/
-.idea/
-*.log
-Thumbs.db
-desktop.ini
+scanner/out/
+scanner/out-test/
+scanner/**/bin/
+scanner/**/obj/
+installer/**/bin/
+installer/**/obj/
+tools/virtual-scanner/out/

@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The scanner worker of Nexus Optimizer. A separate process on purpose:
+    - a 32-bit build is the only way to reach 32-bit TWAIN drivers, which is
+      what most office MFPs still install; a 64-bit build covers the rest and
+      WIA;
+    - a crashing or hanging driver takes this process down, not the program
+      with its already scanned pages.
+    .NET Framework 4.6.2 is part of Windows 10 (1607+) and 11: nothing to
+    install. Built twice by build_installer.ps1:
+      -p:Platform=x86 -p:AssemblyName=NexusScan32
+      -p:Platform=x64 -p:AssemblyName=NexusScan64
+    -p:TestHooks=true adds the fake WIA device used by the tests; release builds
+    never contain it.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net462</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>x86;x64</Platforms>
+    <Platform Condition="'$(Platform)' == '' or '$(Platform)' == 'AnyCPU'">x64</Platform>
+    <PlatformTarget>$(Platform)</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <AssemblyName Condition="'$(AssemblyName)' == ''">NexusScan</AssemblyName>
+    <RootNamespace>NexusScan</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <DebugType>embedded</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <Company>Artur Yurchuk</Company>
+    <Product>Nexus Optimizer</Product>
+    <Copyright>Copyright (c) 2026 Artur Yurchuk</Copyright>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(TestHooks)' == 'true'">
+    <DefineConstants>$(DefineConstants);TEST_HOOKS</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Microsoft.CSharp" />
+    <Reference Include="System.Drawing" />
+  </ItemGroup>
+
+</Project>

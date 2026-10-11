@@ -61,9 +61,16 @@ if (-not $SkipApp) {
     if ($LASTEXITCODE -ne 0) { Fail "pip install" }
 
     & $py make_icon.py
-    Get-Process NexusOptimizer -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process NexusOptimizer, NexusScan64, NexusScan32 -ErrorAction SilentlyContinue | Stop-Process -Force
     if (Test-Path "build") { Remove-Item "build" -Recurse -Force }
     if (Test-Path "dist\NexusOptimizer") { Remove-Item "dist\NexusOptimizer" -Recurse -Force }
+
+    # The scanner worker goes into the bundle as scan\ (see NexusOptimizer.spec);
+    # the test build with the fake WIA device is used by the tests only.
+    & powershell -NoProfile -ExecutionPolicy Bypass -File "scanner\build_scanner.ps1"
+    if ($LASTEXITCODE -ne 0) { Fail "scanner worker" }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File "scanner\build_scanner.ps1" -TestHooks
+    if ($LASTEXITCODE -ne 0) { Fail "scanner worker (test build)" }
 
     & $py -m PyInstaller --noconfirm --clean NexusOptimizer.spec
     if ($LASTEXITCODE -ne 0) { Fail "PyInstaller" }
@@ -80,6 +87,22 @@ if (-not (Test-Path (Join-Path $payload "NexusOptimizer.exe"))) {
 Step 2 "Tests"
 & ".\.venv\Scripts\python.exe" "tests\test_core.py"
 if ($LASTEXITCODE -ne 0) { Fail "tests failed" }
+& ".\.venv\Scripts\python.exe" "tests\test_pdf_regressions.py"
+if ($LASTEXITCODE -ne 0) { Fail "PDF regression tests failed" }
+# Scanner: the worker's test build; the TWAIN tests need the Nexus Virtual
+# Scanner (tools\virtual-scanner) and report SKIP without it.
+$env:NEXUS_SCAN_HELPERS = Join-Path $PSScriptRoot "scanner\out-test"
+& ".\.venv\Scripts\python.exe" "tests\test_scanner.py"
+$scanRc = $LASTEXITCODE
+$env:NEXUS_SCAN_HELPERS = $null
+if ($scanRc -ne 0) { Fail "scanner tests failed" }
+& ".\.venv\Scripts\python.exe" "tests\test_optimizer_310.py"
+if ($LASTEXITCODE -ne 0) { Fail "media/session regression tests failed" }
+& ".\.venv\Scripts\python.exe" "tests\test_lifecycle.py"
+if ($LASTEXITCODE -ne 0) { Fail "GUI/cleanup lifecycle tests failed" }
+& ".\.venv\Scripts\python.exe" "tests\test_packaged.py" --exe (Join-Path $payload "NexusOptimizer.exe")
+if ($LASTEXITCODE -ne 0) { Fail "windowed executable PDF worker tests failed" }
+
 
 # ---- 3. licence and notices shipped next to the program ----
 Step 3 "Licence and notices"
@@ -103,10 +126,11 @@ Write-Host ("    MSI: {0:N1} MB" -f ((Get-Item $msi).Length / 1MB))
 
 # ---- 5. branded installer ----
 Step 5 "NexusOptimizerSetup.exe"
+# The installer targets .NET Framework 4.6.2, which is part of Windows 10/11:
+# a single exe with the MSI embedded, nothing to download on the target PC.
 $publish = Join-Path $artifacts "setup-publish"
 & dotnet publish "installer\Setup\NexusOptimizerSetup.csproj" `
-    -c Release -r win-x64 --self-contained false `
-    -p:PublishSingleFile=true `
+    -c Release `
     -p:MsiPath=$msi `
     -p:Version=$version `
     -p:InformationalVersion=$version `

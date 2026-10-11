@@ -16,11 +16,12 @@ for pkg in ("customtkinter", "tkinterdnd2", "imageio_ffmpeg", "comtypes",
     binaries += b
     hiddenimports += h
 
-# The TWAIN Data Source Manager, when it sits next to the project. A 64-bit
-# twaindsm.dll is not installed by every scanner driver, and without one TWAIN
-# sees no devices at all. The file is optional: the build works without it.
-if os.path.exists("twaindsm.dll"):
-    binaries += [("twaindsm.dll", ".")]
+# The scanner worker (scanner/build_scanner.ps1): NexusScan64.exe and
+# NexusScan32.exe with their own TWAIN managers in x64/ and x86/. Shipped as
+# data, so PyInstaller copies the folder as it is, into scan/ of the bundle.
+if not os.path.exists(os.path.join("scanner", "out", "NexusScan64.exe")):
+    raise SystemExit("scanner/out is missing: run scanner\\build_scanner.ps1 first")
+datas += [(os.path.join("scanner", "out"), "scan")]
 
 a = Analysis(
     ["NexusPDFOptimizer.py"],
