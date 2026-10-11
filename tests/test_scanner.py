@@ -220,7 +220,7 @@ def test_finalize_page_formats_and_cleanup():
         res = nexus.finalize_scan_page(str(src), d / "out", "gray", False, False)
         assert not src.exists(), "the worker's BMP is removed"
         with Image.open(res["path"]) as im:
-            assert res["path"].endswith(".jpg") and im.mode == "L"
+            assert res["path"].endswith(".png") and im.mode == "L", "session pages are lossless"
             assert round(im.info["dpi"][0]) == 300, "the page keeps its real size"
 
         src = d / "in2.bmp"
@@ -251,11 +251,13 @@ def test_rotate_never_touches_a_dragged_in_original():
         before = external.read_bytes()
         new = nexus.rotate_page_file(str(external), 90, nexus.ScanSessionStore.DIR)
         assert external.read_bytes() == before, "the user's own file is not modified"
-        with Image.open(new) as im:
+        assert Path(new).read_bytes() == before, "rotation keeps the encoded JPEG unchanged"
+        with nexus.ScanSessionStore.open_image(new) as im:
             assert im.size == (1100, 800)
         owned = nexus.rotate_page_file(new, 270, nexus.ScanSessionStore.DIR)
-        assert not os.path.exists(new), "a session page is replaced, not duplicated"
-        with Image.open(owned) as im:
+        assert owned == new, "a session page keeps its original raster"
+        assert Path(owned).read_bytes() == before
+        with nexus.ScanSessionStore.open_image(owned) as im:
             assert im.size == (800, 1100)
     finally:
         nexus.ScanSessionStore.DIR = old_dir
@@ -493,10 +495,12 @@ def test_scan_section_end_to_end():
             assert abs(nexus.detect_skew_angle(Image.open(p))) <= 0.25, p
 
         first = sec.pages[0]
+        first_bytes = Path(first).read_bytes()
         sec._page_sel = {first}
         sec._rotate_selected(270)
-        assert _pump(app, lambda: sec.pages[0] != first, 20), "rotation did not apply"
-        with Image.open(sec.pages[0]) as im:
+        assert _pump(app, lambda: nexus.ScanSessionStore.rotation(first) == 270 and not sec._edit_busy, 20), "rotation did not apply"
+        assert Path(first).read_bytes() == first_bytes, "turning a page never reencodes its pixels"
+        with nexus.ScanSessionStore.open_image(sec.pages[0]) as im:
             assert im.width > im.height, "the first page is now landscape"
 
         sec._save_one_pdf()

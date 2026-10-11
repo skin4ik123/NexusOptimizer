@@ -39,15 +39,29 @@ import shutil
 import subprocess
 import logging
 import math
+import base64
+import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
 from typing import List, Tuple, Optional
 from datetime import datetime, timedelta
+from nexus_support import (AtomicOutput, ProcessingCancelled, paths_alias,
+                           allocate_stage, cleanup_stage_journal, copy_atomic,
+                           process_alive, available_memory, resource_workers,
+                           parse_target_bytes, limited_video_scale, remove_owned_tree, unlink_owned)
+import nexus_workers
+import nexus_media
+from nexus_session import ScanStore
+from nexus_labels import LABELS
+from nexus_preview import ComparisonWindow
+from nexus_recovery import RecoveryWindow
+
+_PDF_WORKER_MODE = "--nexus-pdf-worker" in sys.argv
 
 APP_NAME = "Nexus Optimizer"
-APP_VERSION = "3.9.1"
+APP_VERSION = "3.10.0"
 APP_AUTHOR = "Artur Yurchuk"
 APP_CREDIT = f"Crafted by {APP_AUTHOR}"
 
@@ -658,6 +672,7 @@ _CLI_PATHS = [a for a in sys.argv[1:] if not a.startswith("-")]
 # один экземпляр — только во frozen-сборке (dev-запуски и smoke-тесты
 # не мешают друг другу). NEXUS_MULTI=1 принудительно разрешает копии.
 if ((is_frozen() or os.environ.get("NEXUS_SINGLE") == "1")
+        and not _PDF_WORKER_MODE
         and os.environ.get("NEXUS_MULTI") != "1"
         and not _single_instance_acquire()):
     if _forward_to_running(_CLI_PATHS):
@@ -793,7 +808,7 @@ def _boot_splash_thread(ready: threading.Event):
         ready.set()
 
 
-if getattr(sys, "frozen", False):
+if getattr(sys, "frozen", False) and not _PDF_WORKER_MODE:
     _ready = threading.Event()
     threading.Thread(target=_boot_splash_thread, args=(_ready,),
                      daemon=True).start()
@@ -1368,6 +1383,10 @@ TRANSLATIONS = {
 }
 
 
+for _code, _labels in LABELS.items():
+    TRANSLATIONS[_code].update(_labels)
+
+
 def t(key: str) -> str:
     return TRANSLATIONS.get(LANG, TRANSLATIONS["ru"]).get(key, key)
 
@@ -1513,7 +1532,7 @@ HISTORY_FILE = APPDATA_DIR / "history.json"
 # Отдельная временная папка на каждый запуск: несколько копий программы
 # не затирают файлы друг друга.
 TEMP_BASE = Path(tempfile.gettempdir()) / "NexusOptimizer"
-TEMP_DIR = TEMP_BASE / f"run_{os.getpid()}"
+TEMP_DIR = Path(os.environ["NEXUS_WORKER_TEMP"]) if _PDF_WORKER_MODE else TEMP_BASE / f"run_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp", ".gif",
               ".jfif", ".jp2"}
@@ -1535,6 +1554,7 @@ def _startupinfo():
 
 
 stop_flag = threading.Event()
+app_closing = threading.Event()
 history_lock = threading.Lock()
 _active_procs = []
 _active_procs_lock = threading.Lock()
@@ -1542,7 +1562,10 @@ _active_procs_lock = threading.Lock()
 
 def _register_proc(proc):
     with _active_procs_lock:
-        _active_procs.append(proc)
+        if app_closing.is_set():
+            proc.terminate()
+        else:
+            _active_procs.append(proc)
 
 
 def _unregister_proc(proc):
@@ -1582,6 +1605,7 @@ def kill_active_processes():
         try:
             if p.poll() is None:
                 p.kill()
+            p.wait(timeout=1)
         except Exception:
             pass
     with _active_procs_lock:
@@ -1664,6 +1688,36 @@ def find_ffmpeg() -> str | None:
     return None
 
 
+def _capture_command(command, timeout):
+    if stop_flag.is_set():
+        raise ProcessingCancelled()
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               stdin=subprocess.DEVNULL, creationflags=CNW, startupinfo=_startupinfo())
+    _register_proc(process)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if stop_flag.is_set():
+                _terminate_proc(process)
+                raise ProcessingCancelled()
+            if time.monotonic() > deadline:
+                _terminate_proc(process)
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=0.2)
+                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if process.poll() is None:
+            _terminate_proc(process)
+        _unregister_proc(process)
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
+
+
 @functools.lru_cache(maxsize=1)
 def ffmpeg_encoders() -> frozenset:
     """Список кодировщиков в наличном ffmpeg (для автодетекта GPU)."""
@@ -1671,9 +1725,7 @@ def ffmpeg_encoders() -> frozenset:
     if not ff:
         return frozenset()
     try:
-        r = subprocess.run([ff, "-hide_banner", "-encoders"],
-                           capture_output=True, timeout=20,
-                           creationflags=CNW, startupinfo=_startupinfo())
+        r = _capture_command([ff, "-hide_banner", "-encoders"], timeout=20)
         txt = (r.stdout or b"").decode("utf-8", errors="ignore")
         names = set()
         for line in txt.splitlines():
@@ -1729,13 +1781,12 @@ def probe_hw_encoder(enc: str) -> bool:
             log.info("hw probe %s: %s (cache)", enc, "OK" if ok else "unavailable")
             return ok
     try:
-        r = subprocess.run(
+        r = _capture_command(
             [ff, "-hide_banner", "-loglevel", "error",
              "-f", "lavfi", "-i", "color=black:s=128x128:d=0.2:r=15",
              "-frames:v", "3", "-pix_fmt", "nv12", "-c:v", enc,
              "-f", "null", "-"],
-            capture_output=True, timeout=25,
-            creationflags=CNW, startupinfo=_startupinfo())
+            timeout=25)
         ok = r.returncode == 0
         log.info("hw probe %s: %s", enc, "OK" if ok else "unavailable")
     except Exception as e:
@@ -1796,8 +1847,7 @@ def video_out_ext(codec: str, container: str) -> str:
 
 def _probe_duration(ff: str, inp: str) -> float:
     try:
-        pi = subprocess.run([ff, "-i", inp], capture_output=True, timeout=30,
-                            creationflags=CNW, startupinfo=_startupinfo())
+        pi = _capture_command([ff, "-nostdin", "-i", inp], timeout=15)
         err = (pi.stderr or b"").decode("utf-8", errors="ignore")
         mm = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", err)
         if mm:
@@ -1862,174 +1912,81 @@ def _video_codec_args(codec: str, enc: Optional[str], crf: int, preset: str,
 
 
 def _run_ff(cmd: List[str], label: str, duration: float, progress_cb) -> Tuple[int, bytes]:
-    """
-    Запуск ffmpeg: прогресс через -progress pipe:1 (stdout, строки key=value),
-    stderr — во временный файл (никаких дедлоков и проблем с \\r).
-    """
+    """Read progress asynchronously: stop and the watchdog never block on readline."""
     if stop_flag.is_set():
         return -9, b"stopped"
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     errp = TEMP_DIR / f"fferr_{time.time_ns()}.log"
     proc = None
-    tail = b""
+    reader = None
+    messages = queue.Queue()
     try:
         with open(errp, "w+b") as errf:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=errf,
-                stdin=subprocess.DEVNULL,
-                startupinfo=_startupinfo(), creationflags=CNW)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
+                                    stdin=subprocess.DEVNULL, startupinfo=_startupinfo(),
+                                    creationflags=CNW)
             _register_proc(proc)
+
+            def read():
+                try:
+                    for line in proc.stdout:
+                        messages.put(line)
+                finally:
+                    messages.put(None)
+            reader = threading.Thread(target=read, daemon=True, name="ffmpeg-progress")
+            reader.start()
+            last_activity = time.monotonic()
             while True:
                 if stop_flag.is_set():
                     _terminate_proc(proc)
                     return -9, b"stopped"
-                line = proc.stdout.readline() if proc.stdout else b""
-                if not line:
+                if time.monotonic() - last_activity > 300:
+                    _terminate_proc(proc)
+                    return -2, b"FFmpeg stopped reporting progress"
+                try:
+                    line = messages.get(timeout=0.2)
+                except queue.Empty:
                     if proc.poll() is not None:
                         break
-                    time.sleep(0.05)
                     continue
+                if line is None:
+                    break
+                last_activity = time.monotonic()
                 if progress_cb and duration > 0:
                     try:
-                        s = line.decode("utf-8", errors="ignore").strip()
-                        if s.startswith("out_time="):
-                            hh, mm, ss = s.split("=", 1)[1].split(":")
-                            cur = int(hh) * 3600 + int(mm) * 60 + float(ss)
-                            frac = max(0.0, min(0.99, cur / duration))
-                            progress_cb(frac, f"{label}{int(frac * 100)}%")
-                    except Exception:
+                        text = line.decode("utf-8", errors="ignore").strip()
+                        if text.startswith("out_time="):
+                            hh, mm, ss = text.split("=", 1)[1].split(":")
+                            current = int(hh) * 3600 + int(mm) * 60 + float(ss)
+                            fraction = max(0.0, min(0.99, current / duration))
+                            progress_cb(fraction, f"{label}{int(fraction * 100)}%")
+                    except (ValueError, TypeError):
                         pass
             code = proc.wait()
-            try:
-                errf.flush()
-                size = errf.tell()
-                errf.seek(max(0, size - 4000))
-                tail = errf.read()
-            except Exception as e:
-                _log_exc("ff stderr tail", e)
-            return code or 0, tail
-    except Exception as e:
-        _log_exc("ff run", e)
-        return -1, str(e).encode("utf-8", errors="ignore")
+            errf.flush()
+            errf.seek(max(0, errf.tell() - 4000))
+            return code or 0, errf.read()
+    except Exception as error:
+        _log_exc("ff run", error)
+        return -1, str(error).encode("utf-8", errors="ignore")
     finally:
         if proc is not None:
+            if proc.poll() is None:
+                _terminate_proc(proc)
             _unregister_proc(proc)
-            try:
-                if proc.stdout:
-                    proc.stdout.close()
-            except Exception:
-                pass
-        try:
-            errp.unlink(missing_ok=True)
-        except Exception:
-            pass
+            if reader:
+                reader.join(timeout=1)
+            if proc.stdout:
+                proc.stdout.close()
+        errp.unlink(missing_ok=True)
 
 
 def process_video(inp: str, out: str, codec: str, crf: int, preset: str,
                   max_height: int, audio_kbps: int, container: str = "MP4",
-                  use_hw: bool = True,
-                  progress_cb=None) -> Tuple[str, bool, str, int, int]:
-    """
-    Сжатие видео. GPU (QSV/NVENC/AMF/MF) при наличии, откат на CPU при сбое.
-    progress_cb(0..1, text).
-    """
-    orig = 0
-    try:
-        if not os.path.isfile(inp):
-            return inp, False, "err_not_found", 0, 0
-        orig = os.path.getsize(inp)
-        if not ensure_disk_space(inp, int(orig * 1.3)):
-            return inp, False, "err_no_space", orig, 0
-        ff = find_ffmpeg()
-        if not ff:
-            return inp, False, "err_no_ffmpeg", orig, 0
-
-        out, codec = _resolve_video_out(out, codec, container)
-        crf = max(14, min(40, int(crf)))
-        preset = preset or "medium"
-        audio_kbps = max(0, min(320, int(audio_kbps)))
-        cont = Path(out).suffix.lower()
-
-        duration = _probe_duration(ff, inp)
-
-        def build_cmd(enc: Optional[str]) -> List[str]:
-            cmd = [ff, "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
-                   "-progress", "pipe:1", "-stats_period", "0.2",
-                   "-i", inp, "-map_metadata", "-1"]
-            if cont == ".mp4":
-                cmd += ["-movflags", "+faststart"]
-            cmd += _video_codec_args(codec, enc, crf, preset, cont)
-            if max_height and int(max_height) > 0:
-                cmd += ["-vf", f"scale=-2:{int(max_height)}"]
-            if audio_kbps <= 0:
-                cmd += ["-an"]
-            elif cont == ".webm":
-                cmd += ["-c:a", "libopus", "-b:a", f"{audio_kbps}k"]
-            else:
-                cmd += ["-c:a", "aac", "-b:a", f"{audio_kbps}k"]
-            cmd.append(out)
-            return cmd
-
-        # Список попыток: проверенные аппаратные → программный (→ libaom).
-        # Проба кэшируется, поэтому со второго файла список мгновенный;
-        # даже прошедший пробу кодек может упасть на реальном видео —
-        # тогда автоматически идёт следующая попытка.
-        attempts: List[Optional[str]] = []
-        if use_hw:
-            attempts += working_hw_encoders(codec)
-        attempts.append(None)
-        if codec == "AV1":
-            attempts.append("libaom")
-
-        if progress_cb:
-            progress_cb(0.01, "encode...")
-
-        code, err_b = -1, b""
-        for n, enc in enumerate(attempts):
-            try:
-                if os.path.isfile(out):
-                    os.unlink(out)
-            except Exception:
-                pass
-            label = f"{enc or 'cpu'} " if len(attempts) > 1 else ""
-            code, err_b = _run_ff(build_cmd(enc), label, duration, progress_cb)
-            if code == -9 or stop_flag.is_set():
-                try:
-                    if os.path.isfile(out):
-                        os.unlink(out)
-                except Exception:
-                    pass
-                return inp, False, "stopped", orig, 0
-            if code == 0 and os.path.isfile(out) and os.path.getsize(out) > 1000:
-                if enc and enc != "libaom":
-                    log.info("video hw encoder used: %s", enc)
-                break
-            # неудача — лог и следующая попытка
-            log.warning("encoder %s failed (code %s): %s", enc or "software",
-                        code, (err_b or b"")[-300:].decode("utf-8", "ignore"))
-            if progress_cb and n + 1 < len(attempts):
-                progress_cb(0.01, t("hw_fallback") if enc else "retry...")
-        else:
-            pass
-
-        if code != 0 or not os.path.isfile(out) or os.path.getsize(out) < 1000:
-            err = (err_b or b"").decode("utf-8", errors="ignore")[-220:]
-            return inp, False, f"FFmpeg: {err or 'error'}", orig, 0
-
-        new = os.path.getsize(out)
-        if new >= orig:
-            # получилось больше исходника — не считаем успехом
-            try:
-                os.unlink(out)
-            except Exception:
-                pass
-            return inp, False, "err_no_gain", orig, orig
-        if progress_cb:
-            progress_cb(1.0, "100%")
-        return inp, True, "OK", orig, new
-    except Exception as e:
-        _log_exc("process_video", e)
-        return inp, False, str(e)[:140], orig, 0
+                  use_hw: bool = True, progress_cb=None, strip_metadata: bool = True):
+    return nexus_media.compress_video(sys.modules[__name__], inp, out, codec, crf,
+                                      preset, max_height, audio_kbps, container,
+                                      use_hw, progress_cb, strip_metadata)
 
 
 # -------------------- utils --------------------
@@ -2045,21 +2002,14 @@ def load_json(path: Path, default):
 
 
 def save_json(path: Path, data):
-    """Атомарная запись: tmp-файл + os.replace (краш не портит файл)."""
-    tmpf = None
+    """Unique staged names prevent concurrent settings writes colliding."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmpf = path.with_name(path.name + f".tmp{os.getpid()}")
-        with open(tmpf, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmpf, path)
-    except Exception as e:
-        _log_exc("save_json", e)
-        try:
-            if tmpf and tmpf.exists():
-                tmpf.unlink()
-        except Exception:
-            pass
+        with AtomicOutput(path, TEMP_DIR) as stage:
+            with open(stage.path, "w", encoding="utf-8") as stream:
+                json.dump(data, stream, ensure_ascii=False, indent=2)
+            stage.commit()
+    except Exception as error:
+        _log_exc("save_json", error)
 
 
 def load_settings() -> dict:
@@ -2133,33 +2083,33 @@ def add_history(entry: dict):
 
 
 def cleanup_temp():
-    """Удалить свою сессионную временную папку."""
+    """Remove our candidates on every volume, then our own temporary tree."""
     try:
-        if TEMP_DIR.exists():
-            shutil.rmtree(TEMP_DIR, ignore_errors=True)
-    except Exception:
-        pass
+        cleanup_stage_journal(TEMP_DIR)
+        remove_owned_tree(TEMP_DIR)
+    except OSError as error:
+        _log_exc("cleanup temp", error)
 
 
 def cleanup_stale_temp():
-    """Убрать чужой старый мусор (>24 ч), не трогая живые сессии."""
-    try:
-        if not TEMP_BASE.exists():
-            return
-        cutoff = time.time() - 24 * 3600
-        for item in TEMP_BASE.iterdir():
-            try:
-                if item == TEMP_DIR:
-                    continue
-                if item.stat().st_mtime < cutoff:
-                    if item.is_dir():
-                        shutil.rmtree(item, ignore_errors=True)
-                    else:
-                        item.unlink(missing_ok=True)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    """Clean abandoned runs immediately, preserving every living process."""
+    if not TEMP_BASE.exists():
+        return
+    for item in TEMP_BASE.iterdir():
+        if item == TEMP_DIR or item.is_symlink():
+            continue
+        match = re.fullmatch(r"run_(\d+)(?:_[a-f0-9]+)?", item.name)
+        try:
+            if match and not process_alive(int(match.group(1))):
+                cleanup_stage_journal(item)
+                remove_owned_tree(item)
+            elif not match and item.stat().st_mtime < time.time() - 86400:
+                if item.is_dir():
+                    remove_owned_tree(item)
+                else:
+                    item.unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
 def cleanup_batch_temp():
@@ -2181,6 +2131,9 @@ def cleanup_batch_temp():
         pass
 
 
+nexus_workers.configure(
+    [sys.executable] if is_frozen() else [sys.executable, os.path.abspath(__file__)],
+    TEMP_DIR, stop_flag, _register_proc, _unregister_proc, CNW, _startupinfo())
 atexit.register(cleanup_temp)
 
 
@@ -2291,8 +2244,8 @@ def unique_out_path(path: str) -> str:
 
 def apply_rename(template: str, original_path: str) -> str:
     """Пустой шаблон = оставить исходное имя файла."""
-    p = Path(original_path)
-    name = p.stem
+    import ntpath
+    name = os.path.splitext(ntpath.basename(original_path))[0]
     template = (template or "").strip()
     if not template:
         return safe_filename(name)
@@ -2352,83 +2305,69 @@ def move_to_original(path: str) -> bool:
 
 
 def finalize_output(inp: str, out: str, move: bool) -> bool:
-    """
-    Сохранить оригинал и убрать временный суффикс .__nexus_tmp__.
-
-    ВАЖНО: если оригинал сохранить не удалось, финальное имя (= оригинал)
-    НЕ трогаем — сжатый файл остаётся рядом с суффиксом. Потеря данных
-    исключена по построению.
-    """
-    ok = False
-    try:
-        ok = move_to_original(inp) if move else protect_original(inp)
-    except Exception as e:
-        _log_exc("finalize_output move", e)
-        ok = False
-    try:
-        if out and ".__nexus_tmp__" in out and os.path.isfile(out):
-            final = out.replace(".__nexus_tmp__", "")
-            if os.path.normcase(final) == os.path.normcase(out):
-                return ok
-            if os.path.exists(final):
-                if not ok:
-                    log.error("original was not preserved; keeping tmp result: %s", out)
-                    return False
-                try:
-                    os.unlink(final)
-                except Exception as e:
-                    _log_exc("finalize unlink stale", e)
-                    return False
+    preserved = move_to_original(inp) if move else protect_original(inp)
+    if out and ".__nexus_tmp__" in out and os.path.isfile(out):
+        final = out.replace(".__nexus_tmp__", "")
+        if os.path.exists(final):
+            # Neither a failed backup nor a competing new file can authorise
+            # deletion. Publish the completed result under a distinct name.
+            stem, extension = os.path.splitext(final)
+            final = unique_out_path(stem + "_nexus" + extension)
+        try:
             os.rename(out, final)
-    except Exception as e:
-        _log_exc("finalize rename", e)
-    return ok
+        except OSError as error:
+            _log_exc("publish completed result", error)
+    return preserved
 
 
-def merge_pdfs(paths: List[str], output_pdf: str,
-               progress_cb=None) -> Tuple[bool, str, int, int]:
-    """Объединить несколько PDF. Возвращает (ok, msg, added, skipped) —
-    битые/зашифрованные файлы пропускаются, но не молча."""
+def merge_pdfs(paths: List[str], output_pdf: str, progress_cb=None):
     if not fitz:
         return False, "err_pymupdf", 0, len(paths)
+    if any(paths_alias(path, output_pdf) for path in paths):
+        return False, "err_same_file", 0, len(paths)
+    added = skipped = 0
+    doc = fitz.open()
+    toc = []
     try:
-        doc = fitz.open()
-        added = 0
-        total = max(1, len(paths))
-        for i, p in enumerate(paths, 1):
+        for index, path in enumerate(paths, 1):
+            if stop_flag.is_set():
+                raise ProcessingCancelled()
+            offset = doc.page_count
             try:
-                src = fitz.open(p)
-                doc.insert_pdf(src)
-                src.close()
+                with fitz.open(path) as part:
+                    doc.insert_pdf(part)
+                    toc.extend([level, title, page + offset if page > 0 else page]
+                               for level, title, page in part.get_toc())
                 added += 1
-            except Exception as e:
-                _log_exc(f"merge {os.path.basename(p)}", e)
-                continue
-            finally:
-                if progress_cb:
-                    try:
-                        progress_cb(i, total)
-                    except Exception:
-                        pass
-        if added == 0:
-            doc.close()
-            return False, "err_add_pdf", 0, len(paths)
-        doc.save(output_pdf, garbage=4, deflate=True)
+            except Exception as error:
+                if doc.page_count > offset:
+                    doc.delete_pages(offset, doc.page_count - 1)
+                skipped += 1
+                _log_exc("merge PDF", error)
+            if progress_cb:
+                progress_cb(index, max(1, len(paths)))
+        if not added:
+            return False, "err_add_pdf", 0, skipped
+        if toc:
+            doc.set_toc(toc)
+        with AtomicOutput(output_pdf, TEMP_DIR, stop_flag) as stage:
+            doc.save(stage.path, garbage=4, deflate=True)
+            if not _pdf_output_ok(stage.path, doc.page_count):
+                return False, "err_bad_result", 0, len(paths)
+            stage.commit()
+        return True, "OK", added, skipped
+    except ProcessingCancelled:
+        return False, "stopped", 0, len(paths)
+    except Exception as error:
+        return False, str(error)[:120], 0, len(paths)
+    finally:
         doc.close()
-        return True, "OK", added, len(paths) - added
-    except Exception as e:
-        return False, str(e)[:120], 0, len(paths)
 
 
 def get_executor(max_workers):
-    """
-    Параллелизм:
-    - из исходников Python → процессы (реальные ядра);
-    - в .exe → потоки (процессы в onefile снова поднимают GUI).
-    """
-    if is_frozen():
-        return ThreadPoolExecutor(max_workers=max_workers)
-    return ProcessPoolExecutor(max_workers=max_workers)
+    # Threads coordinate media tasks; native PDF work always uses headless
+    # processes, with one persistent process per participating worker.
+    return nexus_workers.NexusExecutor(max_workers=max_workers)
 
 
 def play_sound():
@@ -2751,7 +2690,9 @@ class ScanJob:
             self.proc.stdin.flush()
         except (OSError, ValueError):
             pass
-        threading.Timer(SCAN_CANCEL_GRACE, self._kill, args=("cancel",)).start()
+        timer = threading.Timer(SCAN_CANCEL_GRACE, self._kill, args=("cancel",))
+        timer.daemon = True
+        timer.start()
 
     def _kill(self, why: str):
         if self.running:
@@ -2846,37 +2787,47 @@ def _otsu_threshold(hist: List[int]) -> int:
 
 
 def to_black_and_white(im):
-    """Greyscale or colour to crisp 1-bit, with the threshold taken from the
-    page itself rather than a fixed 128 (pale paper and faint print survive)."""
-    g = im.convert("L")
-    t_ = _otsu_threshold(g.histogram())
-    t_ = max(96, min(208, t_))
-    return g.point(lambda v: 255 if v > t_ else 0, mode="1")
+    """Paper-relative Otsu threshold: pale ink must not turn into white paper."""
+    gray = im.convert("L")
+    histogram = gray.histogram()
+    threshold = _otsu_threshold(histogram)
+    total = sum(histogram)
+    cumulative, paper = 0, 255
+    for value, count in enumerate(histogram):
+        cumulative += count
+        if cumulative * 2 >= total:
+            paper = value
+            break
+    threshold = min(max(80, threshold), max(80, paper - 4))
+    return gray.point(lambda value: 255 if value > threshold else 0, mode="1")
 
 
 def is_blank_page(im) -> bool:
-    """A blank sheet: practically no pixels much darker than the paper.
+    """Conservative blank detection; a faint note is still page content.
 
-    Counted at full resolution in the middle of the page (the edges carry the
-    feeder's shadows). Bleed-through from the other side is only a little
-    darker than the paper and does not count; a lone signature does.
+    This only nominates a page for the recoverable list. It never authorises
+    destruction of the scan. Avoid making bleed-through and pencil equivalent.
     """
     g = im.convert("L")
     w, h = g.size
-    mx, my = int(w * 0.06), int(h * 0.06)
-    if w - 2 * mx < 10 or h - 2 * my < 10:
+    if w < 20 or h < 20:
         return False
+    # Keep a small edge margin: notes near the edge used to disappear too.
+    mx, my = max(1, int(w * 0.015)), max(1, int(h * 0.015))
     core = g.crop((mx, my, w - mx, h - my))
     hist = core.histogram()
     total = sum(hist)
-    cum, paper = 0, 255
-    for v in range(256):
-        cum += hist[v]
-        if cum * 2 >= total:
-            paper = v
+    cumulative, paper = 0, 255
+    for value, count in enumerate(hist):
+        cumulative += count
+        if cumulative * 2 >= total:
+            paper = value
             break
-    limit = max(0, paper - 80)
-    dark = sum(hist[:limit])
+    # An 18-level contrast preserves grey pencil and pale ink. Uniform paper
+    # and weak show-through remain candidates rather than permanent deletions.
+    if paper < 160:
+        return False
+    dark = sum(hist[:max(0, paper - 18)])
     return total > 0 and dark / total < SCAN_BLANK_INK
 
 
@@ -2944,153 +2895,95 @@ def deskew_image(im):
 
 
 def save_page_image(im, path_base: str, dpi: float) -> str:
-    """Final page file: 1-bit pages as PNG (lossless and tiny), the rest as a
-    high-quality JPEG without colour subsampling (stamps and blue signatures
-    keep their edges)."""
-    d = (round(dpi), round(dpi)) if dpi and dpi > 0 else None
-    if im.mode == "1":
-        path = path_base + ".png"
-        im.save(path, "PNG", optimize=True, **({"dpi": d} if d else {}))
-        return path
-    if im.mode not in ("L", "RGB"):
+    """Lossless session pages: exactly one lossy encoding, at final export."""
+    path = path_base + ".png"
+    if im.mode not in ("1", "L", "RGB", "RGBA"):
         im = im.convert("RGB")
-    path = path_base + ".jpg"
-    extra = {"subsampling": 0} if im.mode == "RGB" else {}
-    im.save(path, "JPEG", quality=90, optimize=True, **extra, **({"dpi": d} if d else {}))
+    extra = {"dpi": (round(dpi), round(dpi))} if dpi and dpi > 0 else {}
+    with AtomicOutput(path, TEMP_DIR, stop_flag) as stage:
+        im.save(stage.path, "PNG", compress_level=2, **extra)
+        with Image.open(stage.path) as check:
+            check.load()
+            if check.size != im.size:
+                raise OSError("err_bad_result")
+        stage.commit()
     return path
 
 
 def finalize_scan_page(src: str, dst_dir: Path, want_color: str, deskew: bool,
                        skip_blank: bool, dpi_hint: float = 0) -> dict:
-    """A page from the worker (BMP or the driver's format) to a page file.
+    """Move received pages into recoverable storage before processing.
 
-    Returns {"path", "blank", "angle"}. The source file is always deleted.
-    The colour mode is enforced here as well: a driver that refused the
-    requested mode delivers a richer one, which is converted down.
+    The worker's original disappears only after a complete copy exists. An
+    error or suspected blank page leaves the received raster recoverable.
     """
+    dst_dir = Path(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    raw = str(dst_dir / f"raw_{time.time_ns()}{Path(src).suffix or '.bmp'}")
+    copy_atomic(src, raw, TEMP_DIR)
+    os.unlink(src)
     try:
-        with Image.open(src) as im0:
+        with Image.open(raw) as im0:
             im0.load()
             info_dpi = im0.info.get("dpi")
             im = ImageOps.exif_transpose(im0)
-        dpi = 0.0
+        dpi = float(dpi_hint or 0)
         try:
             if info_dpi and float(info_dpi[0]) >= 50:
                 dpi = float(info_dpi[0])
         except (TypeError, ValueError):
-            dpi = 0.0
-        if not dpi:
-            dpi = float(dpi_hint or 0)
-        if im.mode in ("P", "PA"):
+            pass
+        # Detect blankness before thresholding: BW must not erase faint ink
+        # and then decide that the received page was empty.
+        blank = bool(skip_blank and is_blank_page(im))
+        # A BMP backup can be large. Replace it only with a validated lossless
+        # PNG carrying the same raster, never with another JPEG generation.
+        if im.mode in ("1", "L", "RGB", "RGBA") and Path(raw).suffix.lower() != ".png":
+            compact_raw = save_page_image(im, str(Path(raw).with_suffix("")), dpi)
+            os.unlink(raw)
+            raw = compact_raw
+        changed = False
+        if blank:
+            return {"path": None, "blank": True, "angle": 0.0,
+                    "raw": raw, "recovery_path": raw, "dpi": dpi}
+        if im.mode in ("P", "PA", "RGBA", "LA", "CMYK", "I", "I;16", "F"):
             im = im.convert("RGB")
-        if im.mode in ("RGBA", "LA", "CMYK", "I", "I;16", "F"):
-            im = im.convert("RGB")
+            changed = True
         if want_color == "gray" and im.mode != "L":
             im = im.convert("L")
+            changed = True
         elif want_color == "bw" and im.mode != "1":
             im = to_black_and_white(im)
-        if skip_blank and is_blank_page(im):
-            return {"path": None, "blank": True, "angle": 0.0}
+            changed = True
         angle = 0.0
         if deskew:
             im, angle = deskew_image(im)
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        path = save_page_image(im, str(dst_dir / f"page_{time.time_ns()}"), dpi)
-        return {"path": path, "blank": False, "angle": angle}
-    finally:
-        try:
-            os.unlink(src)
-        except OSError:
-            pass
+        changed = changed or abs(angle) >= 0.2
+        path = save_page_image(im, str(dst_dir / f"page_{time.time_ns()}"), dpi) if changed else raw
+        return {"path": path, "blank": False, "angle": angle, "raw": raw}
+    except Exception as error:
+        _log_exc("scan page", error)
+        return {"path": None, "blank": False, "angle": 0.0, "raw": raw,
+                "recovery_path": raw, "error": str(error)[:120]}
 
 
 def rotate_page_file(path: str, degrees: int, dst_dir: Path) -> str:
-    """A page turned by 90/180/270 degrees (counter-clockwise), as a new file.
-
-    A page that belongs to the scan session is replaced; a picture that was
-    dragged in from elsewhere is never modified - the turned copy goes into
-    the session folder instead.
-    """
-    method = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
-              270: Image.Transpose.ROTATE_270}[degrees % 360]
-    with Image.open(path) as im0:
-        im0.load()
-        info_dpi = im0.info.get("dpi")
-        im = ImageOps.exif_transpose(im0).transpose(method)
-    dpi = 0.0
-    try:
-        dpi = float(info_dpi[0]) if info_dpi else 0.0
-    except (TypeError, ValueError):
-        dpi = 0.0
-    if im.mode not in ("1", "L", "RGB"):
-        im = im.convert("RGB")
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    new = save_page_image(im, str(dst_dir / f"page_{time.time_ns()}"), dpi)
-    if ScanSessionStore.owns(path):
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-    return new
+    """Record rotation, keeping the received image bytes unchanged."""
+    if not ScanSessionStore.owns(path):
+        dst_dir = Path(dst_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        copied = str(dst_dir / f"page_{time.time_ns()}{Path(path).suffix}")
+        copy_atomic(path, copied, TEMP_DIR, stop_flag)
+        path = copied
+    ScanSessionStore.rotate(path, degrees)
+    return path
 
 
-class ScanSessionStore:
-    """Scanned pages live in %LOCALAPPDATA%\\NexusOptimizer\\ScanSession with
-    a manifest of their order. They survive switching sections, closing the
-    program and a crash: a 40-page feeder run is never lost to a misclick."""
-
+class ScanSessionStore(ScanStore):
+    BASE = SCAN_SESSION_DIR
     DIR = SCAN_SESSION_DIR
     FILE = SCAN_SESSION_DIR / "pages.json"
-
-    @classmethod
-    def load(cls) -> List[str]:
-        try:
-            with open(cls.FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return []
-        pages = []
-        for p in data.get("pages", []):
-            p = str(p)
-            if not os.path.isabs(p):
-                p = str(cls.DIR / p)
-            if os.path.isfile(p):
-                pages.append(p)
-        return pages
-
-    @classmethod
-    def save(cls, pages: List[str]):
-        try:
-            cls.DIR.mkdir(parents=True, exist_ok=True)
-            items = [os.path.basename(p) if cls.owns(p) else p for p in pages]
-            tmp = str(cls.FILE) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"version": 1, "pages": items}, f, ensure_ascii=False)
-            os.replace(tmp, cls.FILE)
-        except OSError as e:
-            _log_exc("scan session save", e)
-
-    @classmethod
-    def owns(cls, path: str) -> bool:
-        try:
-            return os.path.normcase(os.path.dirname(os.path.abspath(path))) == \
-                os.path.normcase(str(cls.DIR))
-        except Exception:
-            return False
-
-    @classmethod
-    def sweep(cls, keep: List[str]):
-        """Deletes session files no longer in the list (left by a crash)."""
-        keep_set = {os.path.normcase(os.path.abspath(p)) for p in keep}
-        try:
-            for f in cls.DIR.glob("page_*"):
-                if os.path.normcase(str(f)) not in keep_set:
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
-        except OSError:
-            pass
+    JOURNAL = TEMP_DIR
 
 
 # -------------------- PDF --------------------
@@ -3473,6 +3366,7 @@ def _pdf_recompress_images(doc, target_dpi: int, quality: int, force_gray: bool,
             return _pdf_recompress_images(doc, target_dpi, quality, force_gray,
                                           threads, progress, reader)
     plan = _pdf_collect_plan(inspection)
+    inflight_limit = max(32 << 20, min(PDF_INFLIGHT_BYTES, int(available_memory() * 0.20)))
     items = sorted(plan.items(), key=lambda kv: kv[1]["page"])
     total = max(1, len(items))
     state = {"done": 0, "replaced": 0, "kept": 0, "inflight": 0}
@@ -3506,6 +3400,15 @@ def _pdf_recompress_images(doc, target_dpi: int, quality: int, force_gray: bool,
             if stop_flag.is_set():
                 break
             try:
+                estimate = int(inspection.xref_get_key(xref, "Width")[1]) * int(inspection.xref_get_key(xref, "Height")[1]) * 4
+            except (ValueError, TypeError):
+                estimate = 0
+            while pending and state["inflight"] + estimate > inflight_limit:
+                drain_one()
+            if estimate > available_memory() * 0.50:
+                finish(xref, None, 0, "")
+                continue
+            try:
                 job = _pdf_prepare_image(inspection, xref, place, target_dpi, quality,
                                          force_gray)
             except Exception as e:
@@ -3527,7 +3430,7 @@ def _pdf_recompress_images(doc, target_dpi: int, quality: int, force_gray: bool,
                 finish(xref, res, size, keep_cs, opaque_mask)
                 continue
             while pending and (len(pending) >= threads * 2 or
-                               state["inflight"] > PDF_INFLIGHT_BYTES):
+                               state["inflight"] > inflight_limit):
                 drain_one()
             pending.append((xref, pool.submit(_pdf_encode_job, job), size, keep_cs, opaque_mask))
         while pending:
@@ -3574,15 +3477,10 @@ def _pdf_output_ok(path: str, pages_expected: int, source: str = None) -> bool:
 
 
 def _pdf_same_file(inp: str, out: str) -> bool:
-    if os.path.normcase(os.path.realpath(inp)) == os.path.normcase(os.path.realpath(out)):
-        return True
-    try:
-        return os.path.samefile(inp, out)
-    except OSError:
-        return False
+    return paths_alias(inp, out)
 
 
-def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: bool,
+def _process_pdf_once(inp: str, out: str, preset: str, dpi: int, quality: int, gray: bool,
                 _resolved: dict = None, progress_cb=None, threads: int = 1):
     """
     Сжатие одного PDF. progress_cb(0..1) — прогресс по стадиям.
@@ -3601,7 +3499,7 @@ def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: b
     if not fitz:
         return inp, False, "err_pymupdf", 0, 0
     orig = 0
-    tmp = candidate = None
+    tmp = candidate = candidate_record = None
     try:
         if not os.path.isfile(inp):
             return inp, False, "err_not_found", 0, 0
@@ -3661,9 +3559,7 @@ def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: b
             except Exception:
                 pass
 
-        fd, candidate = tempfile.mkstemp(prefix=".nexus-", suffix=".pdf",
-                                           dir=os.path.dirname(os.path.abspath(out)))
-        os.close(fd)
+        candidate, candidate_record = allocate_stage(out, TEMP_DIR)
         if pikepdf:
             try:
                 with pikepdf.open(tmp) as pdf:
@@ -3700,6 +3596,8 @@ def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: b
             return inp, False, "stopped", orig, 0
         os.replace(candidate, out)
         candidate = None
+        candidate_record.unlink(missing_ok=True)
+        candidate_record = None
         cb(1.0)
         return inp, True, "OK", orig, new
     except PermissionError as e:
@@ -3709,6 +3607,8 @@ def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: b
         _log_exc("process_pdf", e)
         return inp, False, str(e)[:120], orig, 0
     finally:
+        if candidate_record:
+            candidate_record.unlink(missing_ok=True)
         for staged in (tmp, candidate):
             if staged and os.path.exists(staged):
                 try:
@@ -3735,6 +3635,18 @@ def process_single_pdf_parallel(inp: str, out: str, preset: str, dpi: int,
 
     return process_pdf(inp, out, preset, dpi, quality, gray,
                        progress_cb=cb, threads=workers)
+
+
+def process_pdf(inp: str, out: str, preset: str, dpi: int, quality: int, gray: bool,
+                _resolved: dict = None, progress_cb=None, threads: int = 1,
+                target_bytes: int = 0):
+    return nexus_media.compress_pdf(sys.modules[__name__], inp, out, preset, dpi,
+                                    quality, gray, _resolved, progress_cb, threads,
+                                    target_bytes)
+
+
+def pdf_preview(payload):
+    return nexus_media.pdf_preview(sys.modules[__name__], payload)
 
 
 # -------------------- Image --------------------
@@ -3769,147 +3681,14 @@ def _same_format_family(inp: str, fmt: str) -> bool:
     return False
 
 
-def process_image(inp: str, out: str, quality: int, max_side: int, fmt: str, smart: bool):
-    """Сжатие изображения: ICC сохраняется, PNG-графика квантуется,
-    результат без выигрыша откатывается (оригинал не трогается)."""
-    orig = 0
-    try:
-        if not os.path.isfile(inp):
-            return inp, False, "err_not_found", 0, 0
-        orig = os.path.getsize(inp)
-
-        photo_like = is_photo_like_path(inp) if smart else True
-
-        with Image.open(inp) as img0:
-            icc = img0.info.get("icc_profile")
-            img = ImageOps.exif_transpose(img0)
-            img.load()
-
-        fmt = fmt.upper()
-        q = max(15, min(95, safe_int(quality, 75)))
-
-        # Умный режим: для графики/скринов чуть выше качество JPEG
-        if smart and not photo_like and fmt in ("JPEG", "JPG"):
-            q = min(90, q + 8)
-
-        # Приводим к RGB для JPEG
-        if fmt in ("JPEG", "JPG") and img.mode in ("RGBA", "P", "LA"):
-            bg = Image.new("RGB", img.size, (255, 255, 255))
-            if img.mode == "P":
-                img = img.convert("RGBA")
-            mask = img.split()[-1] if img.mode in ("RGBA", "LA") else None
-            bg.paste(img, mask=mask)
-            img = bg
-        elif img.mode not in ("RGB", "L", "RGBA"):
-            img = img.convert("RGB")
-
-        # Ресайз по длинной стороне
-        ms = safe_int(max_side, 0, 0, 20000)
-        if ms > 0:
-            w, h = img.size
-            if max(w, h) > ms:
-                if w >= h:
-                    img = img.resize((ms, max(1, int(h * ms / w))),
-                                     Image.Resampling.LANCZOS)
-                else:
-                    img = img.resize((max(1, int(w * ms / h)), ms),
-                                     Image.Resampling.LANCZOS)
-
-        if fmt in ("JPEG", "JPG"):
-            kw = dict(format="JPEG", quality=q, optimize=True, progressive=True,
-                      subsampling=0 if q >= 90 else 2)
-            if not out.lower().endswith((".jpg", ".jpeg")):
-                out = os.path.splitext(out)[0] + ".jpg"
-        elif fmt == "WEBP":
-            kw = dict(format="WEBP", quality=q, method=6)
-            if not out.lower().endswith(".webp"):
-                out = os.path.splitext(out)[0] + ".webp"
-        else:
-            kw = dict(format="PNG", optimize=True, compress_level=9)
-            if not out.lower().endswith(".png"):
-                out = os.path.splitext(out)[0] + ".png"
-            # Скрины/графику квантуем в палитру — реальный выигрыш PNG
-            if smart and not photo_like and img.mode in ("RGB", "RGBA"):
-                try:
-                    img = img.quantize(256, method=Image.Quantize.FASTOCTREE)
-                except Exception as e:
-                    _log_exc("png quantize", e)
-
-        if icc:
-            kw["icc_profile"] = icc
-
-        img.save(out, **kw)
-
-        new = os.path.getsize(out)
-        if new >= orig * 0.98 and _same_format_family(inp, fmt):
-            # тот же формат и почти без выигрыша (или больше) → откат
-            try:
-                os.unlink(out)
-            except Exception:
-                pass
-            return inp, False, "err_no_gain", orig, orig
-        return inp, True, "OK", orig, new
-    except PermissionError as e:
-        _log_exc("process_image perm", e)
-        return inp, False, "err_no_access", orig, 0
-    except Exception as e:
-        _log_exc("process_image", e)
-        return inp, False, str(e)[:110], orig, 0
+def process_image(inp: str, out: str, quality: int, max_side: int, fmt: str, smart: bool,
+                  effort: str = "balanced", target_bytes: int = 0):
+    return nexus_media.compress_image(sys.modules[__name__], inp, out, quality,
+                                      max_side, fmt, smart, effort, target_bytes)
 
 
-def images_to_pdf(paths: List[str], output_pdf: str,
-                  progress_cb=None) -> Tuple[bool, str, int, int]:
-    """
-    Фото/сканы → PDF с корректным физическим размером страницы:
-    - если в файле есть DPI → точный размер (px / dpi * 72 pt);
-    - иначе страница A4 (портрет/альбом по пропорции), картинка вписывается.
-    JPEG вставляется как есть (без перекодирования). progress_cb(i, total).
-    Возвращает (ok, msg, added, skipped).
-    """
-    if not fitz:
-        return False, "err_pymupdf", 0, len(paths)
-    A4_W, A4_H = 595.0, 842.0
-    try:
-        doc = fitz.open()
-        added = 0
-        total = max(1, len(paths))
-        for pi, p in enumerate(paths, 1):
-            try:
-                with Image.open(p) as im0:
-                    im = ImageOps.exif_transpose(im0)
-                    w_px, h_px = im.size
-                    dpi = 0.0
-                    d = im.info.get("dpi")
-                    try:
-                        if d and float(d[0]) >= 50:
-                            dpi = float(d[0])
-                    except Exception:
-                        dpi = 0.0
-                if dpi:
-                    w_pt = w_px * 72.0 / dpi
-                    h_pt = h_px * 72.0 / dpi
-                else:
-                    w_pt, h_pt = (A4_H, A4_W) if w_px > h_px else (A4_W, A4_H)
-                page = doc.new_page(width=w_pt, height=h_pt)
-                page.insert_image(page.rect, filename=p, keep_proportion=True)
-                added += 1
-            except Exception as e:
-                _log_exc(f"images_to_pdf {os.path.basename(p)}", e)
-                continue
-            finally:
-                if progress_cb:
-                    try:
-                        progress_cb(pi, total)
-                    except Exception:
-                        pass
-        if added == 0:
-            doc.close()
-            return False, "err_add_pages", 0, len(paths)
-        doc.save(output_pdf, garbage=4, deflate=True)
-        doc.close()
-        return True, "OK", added, len(paths) - added
-    except Exception as e:
-        return False, str(e)[:120], 0, len(paths)
+def images_to_pdf(paths: List[str], output_pdf: str, progress_cb=None) -> Tuple[bool, str, int, int]:
+    return nexus_media.images_to_pdf(sys.modules[__name__], paths, output_pdf, progress_cb)
 
 # -------------------- GUI --------------------
 
@@ -4128,6 +3907,79 @@ class BaseSection(ctk.CTkFrame):
                 _log_exc("hotkey", ex)
         return handler
 
+    def _start_task(self, target, args=(), name="nexus-task"):
+        if app_closing.is_set():
+            return None
+        if not hasattr(self.app, "_tasks"):
+            self.app._tasks = set()
+            self.app._task_lock = threading.Lock()
+
+        def run():
+            try:
+                target(*args)
+            except Exception as error:
+                _log_exc(name, error)
+                self.msg_queue.put(("error", str(error)[:160]))
+            finally:
+                with self.app._task_lock:
+                    self.app._tasks.discard(threading.current_thread())
+        thread = threading.Thread(target=run, daemon=True, name=name)
+        with self.app._task_lock:
+            self.app._tasks.add(thread)
+        thread.start()
+        return thread
+
+    def _can_begin(self):
+        busy = self.app.busy_section() if hasattr(self.app, "busy_section") else None
+        if app_closing.is_set():
+            return False
+        if self.is_running or getattr(self, "_preview_busy", False) or getattr(self, "_recovery_busy", False) or getattr(self, "_edit_busy", False) or (busy is not None and busy is not self):
+            self.show_toast(t("other_task_running"), "warn")
+            return False
+        stop_flag.clear()
+        return True
+
+    def _build_target_row(self, parent, kind, effort=False):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=(4, 2))
+        ctk.CTkLabel(row, text=t("target_size")).pack(side="left")
+        self.target_var = ctk.StringVar(value=str(self.settings.get(kind + "_target_mb", "0")))
+        ctk.CTkEntry(row, textvariable=self.target_var, width=75).pack(side="left", padx=(6, 14))
+        if effort:
+            self._effort_map = {t("effort_fast"): "fast", t("effort_balanced"): "balanced",
+                                t("effort_smallest"): "smallest"}
+            current = self.settings.get("img_effort", "balanced")
+            self.effort_var = ctk.StringVar(value=next((key for key, value in self._effort_map.items()
+                                                       if value == current), t("effort_balanced")))
+            ctk.CTkLabel(row, text=t("effort")).pack(side="left")
+            ctk.CTkOptionMenu(row, variable=self.effort_var, values=list(self._effort_map),
+                              width=190, fg_color=CLR_GHOST, button_color=CLR_GHOST_HOVER,
+                              button_hover_color=CLR_ACC, text_color=CLR_GHOST_TEXT).pack(side="left", padx=6)
+        ctk.CTkLabel(parent, text=t("target_hint"), text_color=CLR_MUTED,
+                     justify="left", wraplength=790, font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=10, pady=(0, 3))
+
+    def _preview(self):
+        if not self._can_begin():
+            return
+        path = next((path for path in self.files if path in self._selected and os.path.isfile(path)), None)
+        path = path or next((path for path in self.files if os.path.isfile(path)), None)
+        if not path:
+            self.show_toast(t("no_files"), "warn")
+            return
+        if isinstance(self, PdfSection):
+            payload = {"input": path, "preset": self.preset_map.get(self.preset_var.get(), "smart"),
+                       "dpi": self.dpi_var.get(), "quality": self.q_var.get(), "gray": self.gray_var.get(),
+                       "target_bytes": parse_target_bytes(self.target_var.get())}
+            kind = "pdf"
+        else:
+            payload = {"input": path, "format": self.fmt_var.get(), "quality": self.q_var.get(),
+                       "max_side": safe_int(self.max_var.get(), 0, 0, 20000), "smart": self.smart_var.get(),
+                       "effort": self._effort_map.get(self.effort_var.get(), "balanced"),
+                       "target_bytes": parse_target_bytes(self.target_var.get())}
+            kind = "image"
+        ComparisonWindow(self, sys.modules[__name__], kind, payload)
+
     def on_leave(self):
         """Вызывается контейнером перед уничтожением раздела."""
         try:
@@ -4198,31 +4050,16 @@ class BaseSection(ctk.CTkFrame):
         return None
 
     def _update_summary(self):
-        lbl = getattr(self, "summary_lbl", None)
-        if lbl is None:
-            return
-        if self.is_running:
-            return  # во время работы сводку ведёт run_summary/sum_done
-        try:
-            n = len(self.files)
-            if not n:
-                lbl.configure(text="")
-                return
-            total = sum(self._sizes.get(p, 0) for p in self.files)
-            ratio = self._est_ratio()
-            if ratio:
-                text = t("sum_idle_est").format(
-                    n=n, size=human_size(total), est=human_size(total * ratio))
-            else:
-                text = t("sum_idle").format(n=n, size=human_size(total))
-            if not self.is_running:
-                text += f"    ·    {t('hint_start')}"
-            lbl.configure(text=text)
-        except Exception:
-            pass
+        label = getattr(self, "summary_lbl", None)
+        if label is not None and not self.is_running:
+            count = len(self.files)
+            total = sum(self._sizes.get(path, 0) for path in self.files)
+            label.configure(text=t("sum_idle").format(n=count, size=human_size(total)) if count else "")
 
     def _finish_run(self, status_key: str, color):
         self.is_running = False
+        self._edit_busy = False
+        self._recovery_busy = False
         self._futures = []
         if self.btn:
             self.btn.configure(state="normal")
@@ -4238,7 +4075,8 @@ class BaseSection(ctk.CTkFrame):
 
     def _poll(self):
         try:
-            while True:
+            deadline = time.perf_counter() + 0.012
+            while time.perf_counter() < deadline:
                 item = self.msg_queue.get_nowait()
                 k = item[0]
                 if k == "progress":
@@ -4299,13 +4137,15 @@ class BaseSection(ctk.CTkFrame):
                             done=done, total=total, size=human_size(saved)))
                 elif k == "done":
                     p = item[1] or {}
-                    self._finish_run("done", CLR_ACC)
+                    warning = bool(p.get("failed") or p.get("warnings"))
+                    self._finish_run("done", CLR_WARN if warning else CLR_ACC)
                     self.progress.set(1.0)
                     lbl = getattr(self, "summary_lbl", None)
                     if lbl is not None:
-                        lbl.configure(text=t("sum_done").format(
-                            ok=p.get("ok", 0), total=p.get("total", 0),
-                            size=human_size(p.get("saved", 0))))
+                        lbl.configure(text=t("run_result").format(
+                            done=p.get("processed", 0), total=p.get("total", 0),
+                            changed=p.get("changed", 0), unchanged=p.get("unchanged", 0),
+                            failed=p.get("failed", 0), size=human_size(p.get("saved", 0))))
                     if load_settings().get("sound", True):
                         play_sound()
                     folder = p.get("folder") or ""
@@ -4315,7 +4155,7 @@ class BaseSection(ctk.CTkFrame):
                                   lambda f=folder: os.startfile(f))
                     self.show_toast(t("toast_done").format(
                         ok=p.get("ok", 0), total=p.get("total", 0),
-                        size=human_size(p.get("saved", 0))), "ok", action)
+                        size=human_size(p.get("saved", 0))), "warn" if warning else "ok", action)
                 elif k == "stopped":
                     self._finish_run("stopped", CLR_WARN)
                     self.show_toast(t("stopped"), "warn")
@@ -4402,7 +4242,7 @@ class BaseSection(ctk.CTkFrame):
             _log_exc("toast", e)
 
     def _stop(self):
-        if not self.is_running:
+        if not self.is_running and not getattr(self, "_preview_busy", False) and not getattr(self, "_recovery_busy", False):
             return
         stop_flag.set()
         self._log("⏹ " + t("stopping"))
@@ -4515,6 +4355,8 @@ class BaseSection(ctk.CTkFrame):
                   command=self._remove).pack(side="left", padx=(0, 6))
         btn_ghost(br, text=t("clear_list"), width=110,
                   command=self._clear).pack(side="left")
+        if self.MODE in ("PDF", "Photo"):
+            btn_ghost(br, text=t("preview"), width=160, command=self._preview).pack(side="right", padx=6)
         if extra:
             text, _color, cmd = extra
             btn_ghost(br, text=text, width=160, command=cmd).pack(side="right")
@@ -4601,26 +4443,21 @@ class BaseSection(ctk.CTkFrame):
     def _thumb_request(self, path: str, size, key):
         if not hasattr(self, "_thumb_q"):
             self._thumb_q = queue.Queue()
-            threading.Thread(target=self._thumb_worker, daemon=True).start()
+            self._start_task(self._thumb_worker, name="thumbnails")
         self._thumb_q.put((path, size, key))
 
     def _thumb_worker(self):
         while True:
             try:
                 item = self._thumb_q.get()
-                if item is None:
+                if item is None or app_closing.is_set():
                     return
                 path, size, key = item
                 # рендер в 2× от логического размера: на масштабе 150–200%
                 # CTkImage показывает миниатюру без мыла
                 px2 = (size[0] * 2, size[1] * 2)
-                with Image.open(path) as im:
-                    im.draft("RGB", (px2[0] * 2, px2[1] * 2))
-                    im2 = ImageOps.exif_transpose(im)
-                    # точный размер (кадрирование по центру) —
-                    # миниатюры образуют ровную колонку
-                    pil = ImageOps.fit(im2.convert("RGB"), px2,
-                                       Image.Resampling.LANCZOS)
+                im2 = ScanSessionStore.open_image(path, (px2[0] * 2, px2[1] * 2))
+                pil = ImageOps.fit(im2.convert("RGB"), px2, Image.Resampling.LANCZOS)
                 self.msg_queue.put(("thumb", key, pil, size))
             except Exception as e:
                 _log_exc("thumb worker", e)
@@ -4660,7 +4497,7 @@ class BaseSection(ctk.CTkFrame):
         try:
             chip, bar = rd["chip"], rd["bar"]
             if state == "queued":
-                if rd["state"] in ("done", "fail"):
+                if rd["state"] in ("done", "warn", "unchanged", "limit", "fail"):
                     return
                 bar.grid_remove()
                 chip.grid()
@@ -4680,7 +4517,7 @@ class BaseSection(ctk.CTkFrame):
                     pass
                 bar.configure(mode="determinate")
                 bar.set(max(0.0, min(1.0, float(data or 0))))
-            elif state == "done":
+            elif state in ("done", "warn"):
                 orig, new = data
                 try:
                     bar.stop()
@@ -4692,8 +4529,15 @@ class BaseSection(ctk.CTkFrame):
                 rd["right"].configure(
                     text=f"{human_size(orig)} → {human_size(new)}",
                     text_color=CLR_ACC)
-                chip.configure(text=f"✓ −{pct}%", fg_color=CLR_OK_SOFT,
-                               text_color=CLR_OK)
+                chip.configure(text=(f"✓ −{pct}%" if state == "done" else f"≈ −{pct}%"),
+                               fg_color=CLR_OK_SOFT if state == "done" else CLR_GHOST,
+                               text_color=CLR_OK if state == "done" else CLR_WARN)
+            elif state in ("unchanged", "limit"):
+                bar.stop()
+                bar.grid_remove()
+                chip.grid()
+                chip.configure(text=t("already_optimized") if state == "unchanged" else t("target_unreachable"),
+                               fg_color=CLR_GHOST, text_color=CLR_MUTED if state == "unchanged" else CLR_WARN)
             elif state == "fail":
                 try:
                     bar.stop()
@@ -4721,8 +4565,8 @@ class BaseSection(ctk.CTkFrame):
         bf = ctk.CTkFrame(bot, fg_color="transparent")
         bf.pack(fill="x")
         bf.grid_columnconfigure(1, weight=1)
-        self.summary_lbl = ctk.CTkLabel(bf, text="", text_color=CLR_MUTED,
-                                        font=ctk.CTkFont(size=12))
+        self.summary_lbl = ctk.CTkLabel(bf, text="", text_color=CLR_MUTED, wraplength=360,
+                                        justify="left", font=ctk.CTkFont(size=12))
         self.summary_lbl.grid(row=0, column=0, sticky="w", padx=(2, 14))
         self.btn = btn_primary(bf, text=start_text, height=42,
                                image=icon_active("check", 16), compound="left",
@@ -4919,11 +4763,12 @@ class BaseSection(ctk.CTkFrame):
                 pass
         self.progress.set(0)
         self._log(f"——— {mode} ———")
-        threading.Thread(
-            target=self._batch_worker,
-            args=(snapshot, ext_fn, pool_fn, pool_args_fn, serial_fn,
-                  workers, size_div, mode, single_fn, outdir),
-            daemon=True).start()
+        move = bool(self.move_var.get()) and not outdir
+        template = self.rename_var.get().strip() if hasattr(self, "rename_var") else ""
+        self._start_task(self._batch_worker,
+                         args=(snapshot, ext_fn, pool_fn, pool_args_fn, serial_fn,
+                               workers, size_div, mode, single_fn, outdir, move, template),
+                         name="batch")
 
     @staticmethod
     def _real_out(out: str) -> str:
@@ -4937,131 +4782,111 @@ class BaseSection(ctk.CTkFrame):
         return out
 
     def _batch_worker(self, snapshot, ext_fn, pool_fn, pool_args_fn, serial_fn,
-                      workers, size_div, mode, single_fn, outdir):
+                      workers, size_div, mode, single_fn, outdir, move, template):
         q = self.msg_queue
         total = len(snapshot)
-        success = saved = moved = processed = 0
-        ok_names: List[str] = []
-        custom_out = bool(outdir)
+        changed = unchanged = failed = warnings = saved = moved = processed = 0
+        names = []
         folder = outdir or os.path.dirname(snapshot[0])
-        move = bool(self.move_var.get()) and not custom_out
-        template = self.rename_var.get().strip() if hasattr(self, "rename_var") else ""
-
-        tasks = []
-        planned = set()  # защита от коллизий имён (одноимённые файлы из
-        for inp in snapshot:  # разных папок при общей папке результата)
-            d = outdir or os.path.dirname(inp)
-            newname = apply_rename(template, inp)
-            out = os.path.join(d, newname + ext_fn(inp))
-            # tmp-суффикс — только при записи рядом с исходником: там его
-            # снимает finalize_output. При custom-папке совпадение с
-            # исходником разруливает unique_out_path (файл существует → _2).
-            if not custom_out and os.path.normcase(out) == os.path.normcase(inp):
-                base, ex = os.path.splitext(out)
-                out = base + ".__nexus_tmp__" + ex
+        tasks, planned = [], set()
+        for inp in snapshot:
+            directory = outdir or os.path.dirname(inp)
+            out = os.path.join(directory, apply_rename(template, inp) + ext_fn(inp))
+            if not outdir and paths_alias(inp, out):
+                stem, extension = os.path.splitext(out)
+                out = stem + ".__nexus_tmp__" + extension
             out = unique_out_path(out)
             while os.path.normcase(out) in planned:
-                base, ex = os.path.splitext(out)
-                out = unique_out_path(f"{base}_2{ex}")
+                stem, extension = os.path.splitext(out)
+                out = unique_out_path(stem + "_2" + extension)
             planned.add(os.path.normcase(out))
             tasks.append((inp, out))
-
         q.put(("file_all", list(snapshot)))
 
-        def handle(res, out_hint):
-            nonlocal success, saved, moved, processed
-            inp, ok, msg, orig, new = res
-            name = os.path.basename(inp)
+        def handle(result, hint):
+            nonlocal changed, unchanged, failed, warnings, saved, moved, processed
+            inp, ok, message, orig, new = result
             processed += 1
             if ok:
-                success += 1
-                ok_names.append(name)
+                changed += 1
+                names.append(os.path.basename(hint))
                 saved += max(0, orig - new)
-                pct = (1 - new / orig) * 100 if orig else 0
-                q.put(("file", inp, "done", (orig, new)))
-                q.put(("log", f"✓ {name}  {human_size(orig)}→{human_size(new)} (−{pct:.0f}%)"))
-                if not custom_out and finalize_output(inp, out_hint, move):
+                warning = message == "OK_TARGET_MISSED"
+                warnings += int(warning)
+                q.put(("file", inp, "warn" if warning else "done", (orig, new)))
+                q.put(("log", f"✓ {os.path.basename(inp)}  {human_size(orig)} → {human_size(new)}"))
+                if warning:
+                    q.put(("log", "⚠ " + t("target_missed")))
+                if not outdir and finalize_output(inp, hint, move):
                     moved += 1
-            else:
-                q.put(("file", inp, "fail", msg))
-                q.put(("log", f"✗ {name} — {tr_msg(msg)}"))
+            elif message == "err_no_gain":
+                unchanged += 1
+                q.put(("file", inp, "unchanged", None))
+                q.put(("log", "○ " + os.path.basename(inp) + " — " + t("already_optimized")))
+            elif message != "stopped":
+                failed += 1
+                q.put(("file", inp, "fail", message))
+                q.put(("log", "✗ " + os.path.basename(inp) + " — " + tr_msg(message)))
             q.put(("run_summary", processed, total, saved))
 
         try:
             if single_fn and total == 1:
                 inp, out = tasks[0]
                 q.put(("file", inp, "run", None))
-
-                def put_prog(frac, text):
-                    q.put(("progress", min(0.99, max(0.0, frac)), text))
-                    q.put(("file", inp, "prog", frac))
-                res, out_hint = single_fn(inp, out, put_prog)
-                handle(res, self._real_out(out_hint))
-                q.put(("progress", 1.0, "1/1"))
+                def progress(fraction, text):
+                    q.put(("progress", min(0.99, fraction), text))
+                    q.put(("file", inp, "prog", fraction))
+                result, hint = single_fn(inp, out, progress)
+                handle(result, self._real_out(hint))
             elif workers > 1 and total > 1:
                 q.put(("log", f"{t('run_parallel')}{min(workers, total)}"))
-                with get_executor(max_workers=min(workers, total)) as ex:
-                    if is_frozen():
-                        # В .exe параллелим потоками → можно вешать живой
-                        # статус и процент на каждую строку.
-                        def make_job(_i, _o):
-                            def job():
-                                q.put(("file", _i, "run", None))
-                                return serial_fn(
-                                    _i, _o,
-                                    lambda f, txt, _p=_i:
-                                        q.put(("file", _p, "prog", f)))
-                            return job
-                        fmap = {ex.submit(make_job(i, o)): (i, o)
-                                for i, o in tasks}
-                    else:
-                        # dev-режим: процессы, события недоступны —
-                        # строки идут «в очереди» → результат
-                        fmap = {ex.submit(pool_fn, *pool_args_fn(i, o)): (i, o)
-                                for i, o in tasks}
-                    self._futures = list(fmap.keys())
-                    done = 0
-                    for fut in as_completed(fmap):
+                with get_executor(max_workers=min(workers, total)) as executor:
+                    def job(inp, out):
+                        if stop_flag.is_set():
+                            return inp, False, "stopped", 0, 0
+                        q.put(("file", inp, "run", None))
+                        return serial_fn(inp, out, lambda fraction, text: q.put(("file", inp, "prog", fraction)))
+                    futures = {executor.submit(job, inp, out): (inp, out) for inp, out in tasks}
+                    self._futures = list(futures)
+                    for future in as_completed(futures):
+                        if stop_flag.is_set():
+                            for pending in futures:
+                                pending.cancel()
+                            break
+                        inp, out = futures[future]
+                        try:
+                            result = future.result()
+                        except Exception as error:
+                            result = (inp, False, str(error)[:120], 0, 0)
+                        handle(result, self._real_out(out))
+                        q.put(("progress", processed / total, f"{processed}/{total}"))
+            else:
+                # Reuse one headless PDF process for a serial batch too.
+                with get_executor(max_workers=1) as executor:
+                    for index, (inp, out) in enumerate(tasks):
                         if stop_flag.is_set():
                             break
-                        done += 1
-                        i, o = fmap[fut]
-                        try:
-                            res = fut.result()
-                        except Exception as e:
-                            res = (i, False, str(e)[:80], 0, 0)
-                        handle(res, self._real_out(o))
-                        q.put(("progress", done / total, f"{done}/{total}"))
-            else:
-                for idx, (inp, out) in enumerate(tasks):
-                    if stop_flag.is_set():
-                        break
-                    q.put(("file", inp, "run", None))
-
-                    def put_prog(frac, text, _i=idx, _p=inp):
-                        q.put(("progress", min(0.99, (_i + frac) / total), text))
-                        q.put(("file", _p, "prog", frac))
-                    res = serial_fn(inp, out, put_prog)
-                    handle(res, self._real_out(out))
-                    q.put(("progress", (idx + 1) / total, f"{idx + 1}/{total}"))
-
-            add_history({
-                "time": datetime.now().strftime("%d.%m %H:%M"),
-                "mode": mode,
-                "count": success,
-                "saved_mb": round(saved / 1048576, 2),
-                "folder": folder,
-                "names": ok_names,
-            })
+                        q.put(("file", inp, "run", None))
+                        def progress(fraction, text, i=index, path=inp):
+                            q.put(("progress", min(0.99, (i + fraction) / total), text))
+                            q.put(("file", path, "prog", fraction))
+                        result = executor.submit(serial_fn, inp, out, progress).result()
+                        handle(result, self._real_out(out))
+                        q.put(("progress", processed / total, f"{processed}/{total}"))
+            if not app_closing.is_set():
+                add_history({"time": datetime.now().strftime("%d.%m %H:%M"), "mode": mode,
+                             "count": changed + unchanged, "saved_mb": round(saved / 1048576, 2),
+                             "folder": folder, "names": names})
             cleanup_batch_temp()
             if stop_flag.is_set():
                 q.put(("stopped", None))
             else:
-                q.put(("done", {"ok": success, "total": total, "saved": saved,
-                                "moved": moved, "folder": folder}))
-        except Exception as e:
-            _log_exc("batch worker", e)
-            q.put(("error", str(e)[:300]))
+                q.put(("done", {"ok": changed + unchanged, "total": total, "saved": saved,
+                                "changed": changed, "unchanged": unchanged, "failed": failed,
+                                "warnings": warnings, "processed": processed, "moved": moved, "folder": folder}))
+        except Exception as error:
+            _log_exc("batch worker", error)
+            q.put(("error", str(error)[:300]))
 
     # ---- переопределяемые ----
 
@@ -5165,6 +4990,7 @@ class PdfSection(BaseSection):
             side="left", padx=6)
         ctk.CTkLabel(m2, text=t("name_hint"), text_color=CLR_MUTED).pack(side="left")
 
+        self._build_target_row(more, "pdf")
         self._build_outdir_row(more, "pdf_outdir")
         ctk.CTkFrame(st, fg_color="transparent", height=4).pack()
 
@@ -5205,12 +5031,15 @@ class PdfSection(BaseSection):
             "pdf_recurse": self.recurse_var.get(),
             "pdf_outdir": self._outdir(),
             "pdf_workers": self._workers_setting(),
+            "pdf_target_mb": self.target_var.get(),
             "rename_template": self.rename_var.get(),
             "theme": ctk.get_appearance_mode(),
         })
         return s
 
     def _merge_pdfs(self):
+        if not self._can_begin():
+            return
         if self.is_running:
             self.show_toast(t("waiting"), "warn")
             return
@@ -5255,9 +5084,11 @@ class PdfSection(BaseSection):
             finally:
                 q.put(("op_end", None))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_task(work)
 
     def _start(self):
+        if not self._can_begin():
+            return
         if self.is_running:
             self._log(t("waiting"))
             return
@@ -5269,22 +5100,23 @@ class PdfSection(BaseSection):
         quality = self.q_var.get()
         gray = self.gray_var.get()
         multi = self.multi_var.get()
-        workers = effective_workers(self._workers_setting(), 8,
-                                    len(self.files)) if multi else 1
+        workers = resource_workers(effective_workers(self._workers_setting(), 8,
+                                    len(self.files)), self.files, "pdf") if multi else 1
+        target_bytes = parse_target_bytes(self.target_var.get())
         pages_workers = effective_workers(self._workers_setting(), 8, 8) if multi else 1
 
         def single(inp, out, put_prog):
             self.msg_queue.put(("log", f"{os.path.basename(inp)} — {t('single_pdf_note')}"))
-            res = process_single_pdf_parallel(
-                inp, out, preset, dpi, quality, gray, pages_workers,
-                progress_cb=lambda d, tot, txt: put_prog(
-                    (d / tot) if tot else 0, txt))
+            res = nexus_workers.run_pdf(
+                inp, out, preset, dpi, quality, gray,
+                progress=lambda fraction: put_prog(fraction, f"{int(fraction * 100)}%"),
+                threads=pages_workers, target_bytes=target_bytes)
             return res, out
 
         def serial(i, o, pcb):
             cb = (lambda f: pcb(f, f"{int(f * 100)}%")) if pcb else None
-            return process_pdf(i, o, preset, dpi, quality, gray,
-                               progress_cb=cb)
+            return nexus_workers.run_pdf(i, o, preset, dpi, quality, gray,
+                                         progress=cb, target_bytes=target_bytes)
 
         self._launch_batch(
             ext_fn=lambda inp: ".pdf",
@@ -5393,6 +5225,7 @@ class ImageSection(BaseSection):
             side="left", padx=6)
         ctk.CTkLabel(m3, text=t("name_hint"), text_color=CLR_MUTED).pack(side="left")
 
+        self._build_target_row(more, "img", effort=True)
         self._build_outdir_row(more, "img_outdir")
         ctk.CTkFrame(st, fg_color="transparent", height=4).pack()
 
@@ -5480,6 +5313,8 @@ class ImageSection(BaseSection):
             "img_recurse": self.recurse_var.get(),
             "img_outdir": self._outdir(),
             "img_workers": self._workers_setting(),
+            "img_target_mb": self.target_var.get(),
+            "img_effort": self._effort_map.get(self.effort_var.get(), "balanced"),
             "img_rename": self.rename_var.get(),
             "rename_template": self.rename_var.get(),
             "theme": ctk.get_appearance_mode(),
@@ -5487,6 +5322,8 @@ class ImageSection(BaseSection):
         return s
 
     def _to_pdf(self):
+        if not self._can_begin():
+            return
         if self.is_running:
             self.show_toast(t("waiting"), "warn")
             return
@@ -5528,9 +5365,11 @@ class ImageSection(BaseSection):
             finally:
                 q.put(("op_end", None))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_task(work)
 
     def _start(self):
+        if not self._can_begin():
+            return
         if self.is_running:
             self._log(t("waiting"))
             return
@@ -5542,16 +5381,18 @@ class ImageSection(BaseSection):
         fmt = self.fmt_var.get()
         smart = self.smart_var.get()
         multi = self.multi_var.get()
-        workers = effective_workers(self._workers_setting(), 12,
-                                    len(self.files)) if multi else 1
+        workers = resource_workers(effective_workers(self._workers_setting(), 12,
+                                    len(self.files)), self.files, "image") if multi else 1
+        effort = self._effort_map.get(self.effort_var.get(), "balanced")
+        target_bytes = parse_target_bytes(self.target_var.get())
         ext = ".jpg" if fmt.upper() == "JPEG" else f".{fmt.lower()}"
 
         self._launch_batch(
             ext_fn=lambda inp: ext,
             pool_fn=process_image,
-            pool_args_fn=lambda i, o: (i, o, quality, max_side, fmt, smart),
+            pool_args_fn=lambda i, o: (i, o, quality, max_side, fmt, smart, effort, target_bytes),
             serial_fn=lambda i, o, pcb: process_image(i, o, quality, max_side,
-                                                      fmt, smart),
+                                                      fmt, smart, effort, target_bytes),
             workers=workers,
             size_div=1024,
             mode="Photo",
@@ -5660,11 +5501,15 @@ class VideoSection(BaseSection):
         self.rename_var = ctk.StringVar(value="{name}_nexus")
         ctk.CTkEntry(m3, textvariable=self.rename_var, width=160).pack(side="left")
 
+        self.metadata_var = ctk.BooleanVar(value=bool(self.settings.get("vid_strip_metadata", True)))
+        ctk.CTkCheckBox(more, text=t("strip_metadata"), variable=self.metadata_var,
+                        fg_color=CLR_ACC, hover_color=CLR_ACC_HOVER).pack(
+            anchor="w", padx=10, pady=(4, 2))
         self._build_outdir_row(more, "vid_outdir")
         ctk.CTkFrame(st, fg_color="transparent", height=4).pack()
 
         self._build_bottom(t("compress_selected_video"))
-        threading.Thread(target=self._detect_ffmpeg, daemon=True).start()
+        self._start_task(self._detect_ffmpeg, name="video-encoders")
 
         # честный пресет: правка полей вручную → профиль «Свои»
         self._applying = True
@@ -5777,6 +5622,7 @@ class VideoSection(BaseSection):
             "vid_multi": self.multi_var.get(),
             "vid_move": self.move_var.get(),
             "vid_hw": self.hw_var.get(),
+            "vid_strip_metadata": self.metadata_var.get(),
             "vid_recurse": self.recurse_var.get(),
             "vid_outdir": self._outdir(),
             "vid_rename": self.rename_var.get(),
@@ -5785,6 +5631,8 @@ class VideoSection(BaseSection):
         return s
 
     def _start(self):
+        if not self._can_begin():
+            return
         if self.is_running:
             self._log(t("waiting"))
             return
@@ -5801,26 +5649,27 @@ class VideoSection(BaseSection):
         height = safe_int(self.height_var.get(), 0, 0, 8700)
         audio = safe_int(self.audio_var.get(), 128, 0, 320)
         use_hw = self.hw_var.get()
+        strip_metadata = self.metadata_var.get()
         multi = self.multi_var.get()
         # видео: максимум 2 параллельно — каждое само грузит CPU/GPU
-        workers = min(2, len(self.files)) if multi else 1
+        workers = resource_workers(min(2, len(self.files)), self.files, "video") if multi else 1
         ext = video_out_ext(codec, container)
 
         def single(inp, out, put_prog):
             self.msg_queue.put(("log", t("encoding_one") + os.path.basename(inp)))
             res = process_video(inp, out, codec, crf, preset, height, audio,
                                 container, use_hw,
-                                progress_cb=lambda f, txt: put_prog(f, txt))
+                                progress_cb=lambda f, txt: put_prog(f, txt), strip_metadata=strip_metadata)
             return res, out
 
         self._launch_batch(
             ext_fn=lambda inp: ext,
             pool_fn=process_video,
             pool_args_fn=lambda i, o: (i, o, codec, crf, preset, height, audio,
-                                       container, use_hw, None),
+                                       container, use_hw, None, strip_metadata),
             serial_fn=lambda i, o, pcb: process_video(
                 i, o, codec, crf, preset, height, audio, container, use_hw,
-                lambda f, txt: pcb(f, txt)),
+                lambda f, txt: pcb(f, txt), strip_metadata),
             workers=workers,
             size_div=1048576,
             mode="Video",
@@ -5848,10 +5697,15 @@ class ScanSection(BaseSection):
         self._job_info: dict = {}
         self._pages_q: queue.Queue = queue.Queue()
         self._listing = False
+        self._transient_recovery = []
+        self._active_device_key = None
+        self._recovery_window = None
+        self._recovery_busy = False
+        self._edit_busy = False
         super().__init__(app, "scanner")
-        threading.Thread(target=self._page_worker, daemon=True,
-                         name="scan-pages").start()
+        self._start_task(self._page_worker, name="scan-pages")
         self._refresh_pages_ui()
+        self._update_recovery()
         if self.pages:
             self._log(t("scan_restored").format(n=len(self.pages)))
         self._refresh_scanners()
@@ -5885,6 +5739,8 @@ class ScanSection(BaseSection):
                                      justify="left", wraplength=280,
                                      font=ctk.CTkFont(size=12))
         self.dev_note.pack(anchor="w", padx=10, pady=(0, 2))
+        btn_ghost(left, text=t("diagnostics"), command=self._save_diagnostics).pack(
+            fill="x", padx=10, pady=(2, 4))
 
         head(t("scan_settings"))
         self.ui_var = ctk.BooleanVar(value=False)
@@ -5932,6 +5788,9 @@ class ScanSection(BaseSection):
                               text_color=CLR_GHOST_TEXT).pack(side="right")
 
         head(t("scan_after"))
+        ctk.CTkLabel(left, text=t("session_scan_hint"), text_color=CLR_MUTED,
+                     wraplength=280, justify="left", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=10, pady=(0, 4))
         self.deskew_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(left, text=t("scan_deskew"), variable=self.deskew_var,
                         fg_color=CLR_ACC, hover_color=CLR_ACC_HOVER).pack(
@@ -5965,6 +5824,9 @@ class ScanSection(BaseSection):
         self.comp_frame.pack(fill="x", padx=6, pady=2)
         r2 = ctk.CTkFrame(self.comp_frame, fg_color="transparent")
         r2.pack(fill="x", padx=4, pady=2)
+        self._scan_preset_map = {t("smart_pdf"): "smart", t("aggressive"): "aggressive",
+                                 t("max_compress"): "max", t("balanced"): "balanced",
+                                 t("quality"): "quality", t("custom"): "custom"}
         self.pdf_preset_var = ctk.StringVar(value=t("smart_pdf"))
         ctk.CTkOptionMenu(r2, variable=self.pdf_preset_var,
                           values=[t("smart_pdf"), t("aggressive"), t("max_compress"),
@@ -5996,22 +5858,26 @@ class ScanSection(BaseSection):
                      font=ctk.CTkFont(weight="bold")).pack(side="left")
         self.pages_count = ctk.CTkLabel(top, text="0", text_color=CLR_MUTED)
         self.pages_count.pack(side="right")
+        self.recovery_button = btn_ghost(top, text=t("recovery_pages"), width=150,
+                                          command=self._show_recovery)
+        self.recovery_button.pack(side="right", padx=8)
 
         # Кнопки — снизу, ДО растягивающейся сетки: при сжатии окна
         # их не выдавливает за край
         br = ctk.CTkFrame(right, fg_color="transparent")
         br.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
         btn_ghost(br, text="", image=icon("rot_l", 20), width=44,
-                  command=lambda: self._rotate_selected(90)).pack(side="left")
+                  command=lambda: self._rotate_selected(90)).grid(row=0, column=0, padx=2, pady=2)
         btn_ghost(br, text="", image=icon("rot_r", 20), width=44,
-                  command=lambda: self._rotate_selected(270)).pack(side="left",
-                                                                   padx=(4, 10))
+                  command=lambda: self._rotate_selected(270)).grid(row=0, column=1, padx=2, pady=2)
         btn_ghost(br, text=t("scan_select_all"), width=110,
-                  command=self._select_all_pages).pack(side="left", padx=(0, 6))
+                  command=self._select_all_pages).grid(row=0, column=2, padx=2, pady=2)
         btn_ghost(br, text=t("remove_sel"), width=130,
-                  command=self._remove_pages).pack(side="left", padx=(0, 6))
+                  command=self._remove_pages).grid(row=0, column=3, padx=2, pady=2)
         btn_ghost(br, text=t("clear_list"), width=120,
-                  command=self._clear_pages).pack(side="left")
+                  command=self._clear_pages).grid(row=1, column=0, columnspan=2, padx=2, pady=2)
+        btn_ghost(br, text=t("restore_original"), width=210,
+                  command=self._restore_original).grid(row=1, column=2, columnspan=2, padx=2, pady=2)
 
         # Страницы — сетка миниатюр: клик = выбор, перетаскивание = порядок
         self.pages_area = ctk.CTkScrollableFrame(right, fg_color=CLR_LIST_BG,
@@ -6045,6 +5911,8 @@ class ScanSection(BaseSection):
                   command=self._save_one_pdf).pack(side="left", padx=(0, 8))
         btn_ghost(af, text=t("save_jpg"), width=150, height=42,
                   command=self._save_jpg).pack(side="left")
+        btn_ghost(af, text=t("stop_esc"), width=100, height=42,
+                  command=self._stop).pack(side="left", padx=8)
 
         bot = ctk.CTkFrame(self, fg_color="transparent")
         bot.pack(side="bottom", fill="x", padx=12, pady=(2, 10))
@@ -6125,7 +5993,7 @@ class ScanSection(BaseSection):
                 wia_off = wia_service_running() is False
             self.msg_queue.put(("scan_devices", (devices, notes, wia_off)))
 
-        threading.Thread(target=work, daemon=True, name="scan-list").start()
+        self._start_task(work, name="scan-list")
 
     def _apply_devices(self, devices, notes, wia_off):
         self._listing = False
@@ -6140,6 +6008,7 @@ class ScanSection(BaseSection):
             if devices:
                 self.dev_list.selection_set(idx)
                 self.dev_list.see(idx)
+                self._remember_device(save_previous=False)
             codes = {n.get("code") for n in notes}
             if "helpers_missing" in codes:
                 note = t("scan_err_helpers_missing")
@@ -6162,12 +6031,66 @@ class ScanSection(BaseSection):
             return self.devices[sel[0]]
         return self.devices[0] if len(self.devices) == 1 else None
 
-    def _remember_device(self):
-        dev = self._selected_device()
-        if dev is not None:
-            s = load_settings()
-            s["scan_device"] = dev.key
-            save_settings(s)
+    def _remember_device(self, save_previous=True):
+        device = self._selected_device()
+        if device is None:
+            return
+        settings = load_settings()
+        profiles = settings.get("scan_profiles", {})
+        if not isinstance(profiles, dict):
+            profiles = {}
+        if save_previous and self._active_device_key and self._active_device_key != device.key:
+            profiles[self._active_device_key] = {**self._scan_opts(),
+                "deskew": bool(self.deskew_var.get()), "skip_blank": bool(self.blank_var.get())}
+        if self._active_device_key != device.key:
+            profile = profiles.get(device.key, {})
+            if profile:
+                self.ui_var.set(bool(profile.get("ui", False)))
+                self.src_var.set(self._label_for(self._src_map, profile.get("source"), t("scan_src_flatbed")))
+                self.col_var.set(self._label_for(self._col_map, profile.get("color"), t("scan_col_color")))
+                self.dpi_var.set(self._label_for(self._dpi_map, profile.get("dpi", 300), "300 dpi"))
+                self.pap_var.set(self._label_for(self._pap_map, profile.get("paper"), "A4"))
+                self.deskew_var.set(bool(profile.get("deskew", True)))
+                self.blank_var.set(bool(profile.get("skip_blank", True)))
+                self._toggle_ui_mode()
+            self._active_device_key = device.key
+        settings["scan_device"] = device.key
+        settings["scan_profiles"] = profiles
+        save_settings(settings)
+
+    def _save_diagnostics(self):
+        path = filedialog.asksaveasfilename(parent=self.app, defaultextension=".json",
+                                           initialfile="NexusOptimizer-scanner.json",
+                                           filetypes=[("JSON", "*.json")], title=t("diagnostics"))
+        if not path:
+            return
+        device = self._selected_device()
+        info = self._job_info
+        report = {"version": APP_VERSION, "requested": self._scan_opts(),
+                  "actual": info.get("actual"), "warnings": info.get("warnings", []),
+                  "error": info.get("error"), "received": info.get("received", 0),
+                  "saved": info.get("added", 0), "recoverable": len(ScanSessionStore.recovery()),
+                  "device": {"name": device.name, "backend": device.backend,
+                             "arch": device.arch} if device else None}
+        try:
+            with AtomicOutput(path, TEMP_DIR) as stage:
+                Path(stage.path).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+                stage.commit()
+            self.show_toast(t("diagnostics_saved"), "ok")
+        except OSError as error:
+            self.show_toast(str(error), "err")
+
+    def _update_recovery(self):
+        count = len(ScanSessionStore.recovery()) + len(self._transient_recovery)
+        self.recovery_button.configure(text=t("recovery_count").format(n=count) if count else t("recovery_pages"))
+
+    def _show_recovery(self):
+        window = self._recovery_window
+        if window is not None and window.winfo_exists():
+            window.refresh()
+            window.lift()
+        else:
+            self._recovery_window = RecoveryWindow(self, sys.modules[__name__])
 
     # ------------------------------------------------------------ scanning
 
@@ -6185,6 +6108,8 @@ class ScanSection(BaseSection):
             self._cancel_scan()
             return
         if self.is_running:
+            return
+        if not self._can_begin():
             return
         dev = self._selected_device()
         if dev is None:
@@ -6230,9 +6155,10 @@ class ScanSection(BaseSection):
         self._job.cancel()
 
     def _stop(self):
-        """Esc: остановить сканирование."""
         if self._job is not None:
             self._cancel_scan()
+        else:
+            super()._stop()
 
     def _set_status(self, text: str, color=None):
         try:
@@ -6252,6 +6178,25 @@ class ScanSection(BaseSection):
             self._finish_scan(item[1])
         elif kind == "scan_rotated":
             self._apply_rotation(item[1])
+        elif kind == "scan_recovered":
+            self._recovery_busy = False
+            for path in item[1]:
+                if path not in self.pages:
+                    self.pages.append(path)
+            restored = set(item[1])
+            self._transient_recovery = [record for record in self._transient_recovery if record["path"] not in restored]
+            ScanSessionStore.save(self.pages)
+            self._refresh_pages_ui()
+            self._update_recovery()
+            self.show_toast(t("restore_count").format(n=len(item[1])), "ok")
+            if self._recovery_window is not None and self._recovery_window.winfo_exists():
+                self._recovery_window.refresh()
+                self._recovery_window.restore_button.configure(state="normal")
+        elif kind == "recovery_saved":
+            self._recovery_busy = False
+            self.show_toast(t("restore_count").format(n=item[1]), "ok")
+            if self._recovery_window is not None and self._recovery_window.winfo_exists():
+                self._recovery_window.save_button.configure(state="normal")
 
     def _on_scan_event(self, ev: dict):
         info = self._job_info
@@ -6269,6 +6214,7 @@ class ScanSection(BaseSection):
                 self._set_status(t("scan_st_scanning").format(n=n) if n
                                  else t("scan_st_scanning0"), CLR_WARN)
         elif kind == "settings":
+            info["actual"] = dict(ev)
             info["feeder"] = bool(ev.get("feeder"))
             if ev.get("dpi"):
                 info["dpi"] = ev.get("dpi")
@@ -6287,6 +6233,7 @@ class ScanSection(BaseSection):
             info["warnings"].append(text)
             self._log("⚠ " + text)
         elif kind == "page":
+            info.setdefault("raw_paths", []).append(ev["path"])
             info["received"] = info.get("received", 0) + 1
             self._set_status(t("scan_st_scanning").format(n=info["received"]),
                              CLR_WARN)
@@ -6305,28 +6252,33 @@ class ScanSection(BaseSection):
     def _page_worker(self):
         while True:
             item = self._pages_q.get()
-            if item is None:
+            if item is None or app_closing.is_set():
                 return
             if item[0] == "done":
                 self.msg_queue.put(("scan_finished", item[1]))
                 continue
-            _k, ev, opts, feeder, dpi, deskew, skip_blank = item
-            # пустые страницы — забота автоподатчика; на стекле пустой
-            # лист значит, что сканировали не то, и это надо видеть
+            _kind, event, opts, feeder, dpi, deskew, skip_blank = item
             use_feeder = feeder if feeder is not None else opts.get("source") != "flatbed"
             try:
-                res = finalize_scan_page(ev["path"], ScanSessionStore.DIR,
-                                         opts.get("color", "color"), deskew,
-                                         skip_blank and bool(use_feeder),
-                                         float(ev.get("dpi") or dpi or 0))
-            except Exception as e:
-                _log_exc("scan page", e)
-                res = {"path": None, "blank": False, "angle": 0.0,
-                       "error": str(e)[:120]}
-            self.msg_queue.put(("scan_page_ready", res))
+                result = finalize_scan_page(event["path"], ScanSessionStore.DIR,
+                                            opts.get("color", "color"), deskew,
+                                            skip_blank and bool(use_feeder),
+                                            float(event.get("dpi") or dpi or 0))
+            except Exception as error:
+                _log_exc("scan page", error)
+                result = {"path": None, "blank": False, "angle": 0.0,
+                          "error": str(error)[:120], "recovery_path": event["path"]}
+            try:
+                ScanSessionStore.record_result(result)
+            except OSError as error:
+                _log_exc("scan recovery record", error)
+                if result.get("recovery_path"):
+                    self._transient_recovery.append({"path": result["recovery_path"], "reason": "error"})
+            self.msg_queue.put(("scan_page_ready", result))
 
     def _add_scanned_page(self, res: dict):
         info = self._job_info
+        self._update_recovery()
         if res.get("blank"):
             info["blank"] = info.get("blank", 0) + 1
             self._log("◌ " + t("scan_blank_skipped"))
@@ -6368,7 +6320,8 @@ class ScanSection(BaseSection):
         except Exception:
             pass
         try:
-            shutil.rmtree(info.get("out", ""), ignore_errors=True)
+            if not any(os.path.isfile(path) for path in info.get("raw_paths", [])):
+                shutil.rmtree(info.get("out", ""), ignore_errors=True)
         except Exception:
             pass
         added, blank, straight = info.get("added", 0), info.get("blank", 0), \
@@ -6553,6 +6506,10 @@ class ScanSection(BaseSection):
 
     def _apply_thumb(self, key, pil, disp):
         kind, ident = key
+        if kind == "recovery":
+            if self._recovery_window is not None and self._recovery_window.winfo_exists():
+                self._recovery_window.apply_thumb(ident, pil, disp)
+            return
         if kind == "page":
             try:
                 img = ctk.CTkImage(light_image=pil, dark_image=pil, size=disp)
@@ -6630,29 +6587,57 @@ class ScanSection(BaseSection):
         if not targets:
             self.show_toast(t("select_pages_first"), "warn")
             return
-        if self.is_running:
+        if not self._can_begin():
             return
+        self._edit_busy = True
 
         def work():
             mapping = {}
             for p in targets:
+                if stop_flag.is_set():
+                    break
                 try:
                     mapping[p] = rotate_page_file(p, degrees, ScanSessionStore.DIR)
                 except Exception as e:
                     _log_exc("rotate page", e)
             self.msg_queue.put(("scan_rotated", mapping))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_task(work)
 
     def _apply_rotation(self, mapping: dict):
+        self._edit_busy = False
         if not mapping:
             return
-        self.pages = [mapping.get(p, p) for p in self.pages]
-        self._page_sel = {mapping.get(p, p) for p in self._page_sel}
+        copied = any(old != new for old, new in mapping.items())
+        self.pages = [mapping.get(path, path) for path in self.pages]
+        self._page_sel = {mapping.get(path, path) for path in self._page_sel}
         for old in mapping:
             self._thumb_cache.pop(old, None)
         ScanSessionStore.save(self.pages)
-        self._refresh_pages_ui()
+        if copied:
+            self._refresh_pages_ui()
+        else:
+            # Repaint only changed thumbnails rather than recreating a whole scan run.
+            for path in mapping.values():
+                card = self._page_cards.get(path)
+                if card:
+                    card["img"].configure(text="…", image=None)
+                    self._thumb_request(path, (92, 118), ("page", path))
+
+    def _restore_original(self):
+        if self.is_running:
+            return
+        mapping = {}
+        for path in self.pages:
+            if path in self._page_sel:
+                original = ScanSessionStore.original(path)
+                if original != path or ScanSessionStore.rotation(path):
+                    if original != path:
+                        ScanSessionStore.recover_page(path)
+                    ScanSessionStore.rotate(original, -ScanSessionStore.rotation(original))
+                    mapping[path] = original
+        self._apply_rotation(mapping)
+        self._update_recovery()
 
     def _remove(self):
         # Del в сканере работает со страницами, а не с self.files
@@ -6662,48 +6647,34 @@ class ScanSection(BaseSection):
         self._clear_pages()
 
     def _remove_pages(self):
-        if not self._page_sel:
+        if self.is_running:
             return
-        for p in list(self._page_sel):
-            if ScanSessionStore.owns(p):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
-            if p in self.pages:
-                self.pages.remove(p)
-            self._thumb_cache.pop(p, None)
+        for path in list(self._page_sel):
+            ScanSessionStore.recover_page(path)
+            if path in self.pages:
+                self.pages.remove(path)
+            self._thumb_cache.pop(path, None)
         self._page_sel.clear()
         ScanSessionStore.save(self.pages)
         self._refresh_pages_ui()
+        self._update_recovery()
 
     def _clear_pages(self):
-        if self.pages and not messagebox.askyesno(APP_NAME, t("clear_pages_q")):
+        if self.is_running:
             return
-        for p in self.pages:
-            if ScanSessionStore.owns(p):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+        for path in self.pages:
+            ScanSessionStore.recover_page(path)
         self.pages.clear()
         self._page_sel.clear()
         self._thumb_cache.clear()
         ScanSessionStore.save(self.pages)
         self._refresh_pages_ui()
+        self._update_recovery()
 
     # ---------------------------------------------------------------- save
 
     def _preset_key(self) -> str:
-        m = {
-            t("smart_pdf"): "smart",
-            t("aggressive"): "aggressive",
-            t("max_compress"): "max",
-            t("balanced"): "balanced",
-            t("quality"): "quality",
-            t("custom"): "custom",
-        }
-        return m.get(self.pdf_preset_var.get(), "smart")
+        return self._scan_preset_map.get(self.pdf_preset_var.get(), "smart")
 
     def _ensure_folder(self) -> str:
         folder = self.folder_var.get().strip() or \
@@ -6729,6 +6700,8 @@ class ScanSection(BaseSection):
                 pass
 
     def _save_one_pdf(self):
+        if not self._can_begin():
+            return
         if not self.pages:
             self.show_toast(t("no_pages_scan"), "warn")
             return
@@ -6765,14 +6738,17 @@ class ScanSection(BaseSection):
                     self.msg_queue.put(("toast", tr_msg(msg), "err", None))
                     return
                 if compress:
-                    _i, ok2, msg2, orig, new = process_pdf(
+                    _i, ok2, msg2, orig, new = nexus_workers.run_pdf(
                         raw_pdf, out_pdf, preset, dpi, quality, gray,
-                        progress_cb=lambda f: self.msg_queue.put(
+                        progress=lambda f: self.msg_queue.put(
                             ("progress", 0.5 + 0.5 * f, f"{int(f * 100)}%")),
                         threads=min(4, MAX_WORKERS))
+                    if msg2 == "stopped" or stop_flag.is_set():
+                        return
                     if not ok2:
-                        # сжатие без выигрыша → исходник ещё на месте
-                        shutil.copy2(raw_pdf, out_pdf)
+                        if msg2 != "err_no_gain":
+                            self.msg_queue.put(("log", "⚠ " + tr_msg(msg2)))
+                        copy_atomic(raw_pdf, out_pdf, TEMP_DIR, stop_flag)
                 size = os.path.getsize(out_pdf)
                 self.msg_queue.put(("log", f"✓ PDF: {out_pdf} ({size / 1024:.0f} KB)"))
                 text = f"{t('pdf_created')} {os.path.basename(out_pdf)}  ·  " \
@@ -6801,9 +6777,11 @@ class ScanSection(BaseSection):
                     pass
                 self.is_running = False
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_task(work)
 
     def _save_jpg(self):
+        if not self._can_begin():
+            return
         """Все страницы → JPG в папку (с опциональным сжатием)."""
         if not self.pages:
             self.show_toast(t("no_pages"), "warn")
@@ -6827,6 +6805,8 @@ class ScanSection(BaseSection):
                 ok_n = 0
                 stamp = datetime.now().strftime("%H%M%S")
                 for i, p in enumerate(pages, 1):
+                    if stop_flag.is_set():
+                        break
                     out = unique_out_path(str(Path(folder) / f"scan_{i:02d}_{stamp}.jpg"))
                     ok = False
                     msg = ""
@@ -6857,19 +6837,26 @@ class ScanSection(BaseSection):
             finally:
                 self.is_running = False
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_task(work)
 
     @staticmethod
     def _plain_jpg(src: str, out: str) -> bool:
+        if paths_alias(src, out):
+            return False
         try:
-            with Image.open(src) as im0:
-                im = ImageOps.exif_transpose(im0)
-                if im.mode not in ("L", "RGB"):
-                    im = im.convert("RGB")
-                im.save(out, "JPEG", quality=92, optimize=True)
+            image = ScanSessionStore.open_image(src)
+            if image.mode not in ("L", "RGB"):
+                image = image.convert("RGB")
+            with AtomicOutput(out, TEMP_DIR, stop_flag) as stage:
+                image.save(stage.path, "JPEG", quality=92, optimize=True)
+                with Image.open(stage.path) as check:
+                    check.load()
+                    if check.size != image.size:
+                        return False
+                stage.commit()
             return True
-        except Exception as e:
-            _log_exc("plain jpg", e)
+        except Exception as error:
+            _log_exc("export scan JPEG", error)
             return False
 
     # ------------------------------------------------------------ settings
@@ -6881,7 +6868,15 @@ class ScanSection(BaseSection):
     def _apply(self):
         s = self.settings
         self.compress_var.set(bool(s.get("scan_compress", True)))
-        self.pdf_preset_var.set(s.get("scan_pdf_preset") or t("smart_pdf"))
+        key = s.get("scan_pdf_preset_key")
+        if not key:
+            legacy = s.get("scan_pdf_preset")
+            legacy_keys = {table[label]: key for table in TRANSLATIONS.values()
+                           for label, key in (("smart_pdf", "smart"), ("aggressive", "aggressive"),
+                                              ("max_compress", "max"), ("balanced", "balanced"),
+                                              ("quality", "quality"), ("custom", "custom"))}
+            key = legacy_keys.get(legacy, "smart")
+        self.pdf_preset_var.set(self._label_for(self._scan_preset_map, key, t("smart_pdf")))
         self.comp_dpi.set(str(safe_int(s.get("scan_comp_dpi"), 130, 50, 300)))
         self.comp_q.set(str(safe_int(s.get("scan_comp_q"), 68, 20, 95)))
         self.gray_var.set(bool(s.get("scan_gray", False)))
@@ -6907,6 +6902,7 @@ class ScanSection(BaseSection):
         s.update({
             "scan_compress": self.compress_var.get(),
             "scan_pdf_preset": self.pdf_preset_var.get(),
+            "scan_pdf_preset_key": self._preset_key(),
             "scan_comp_dpi": safe_int(self.comp_dpi.get(), 130, 50, 300),
             "scan_comp_q": safe_int(self.comp_q.get(), 68, 20, 95),
             "scan_gray": self.gray_var.get(),
@@ -6924,6 +6920,12 @@ class ScanSection(BaseSection):
         dev = self._selected_device() if hasattr(self, "dev_list") else None
         if dev is not None:
             s["scan_device"] = dev.key
+            profiles = s.get("scan_profiles", {})
+            if not isinstance(profiles, dict):
+                profiles = {}
+            profiles[dev.key] = {**opts, "deskew": bool(self.deskew_var.get()),
+                                 "skip_blank": bool(self.blank_var.get())}
+            s["scan_profiles"] = profiles
         return s
 
     def _start(self):
@@ -7122,7 +7124,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self.title(t("settings"))
         self.resizable(False, False)
         self.transient(app)
-        center_window(self, 352, 322)
+        center_window(self, 460, 450)
 
         ctk.CTkLabel(self, text=t("settings"),
                      font=ctk.CTkFont(size=16, weight="bold")).pack(
@@ -7173,6 +7175,9 @@ class SettingsWindow(ctk.CTkToplevel):
                      font=ctk.CTkFont(size=10)).pack(
             anchor="w", padx=46, pady=(2, 0))
 
+        ctk.CTkLabel(self, text=t("session_cleanup_hint"), text_color=CLR_MUTED,
+                     wraplength=420, justify="left", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=18, pady=(12, 0))
         ctk.CTkLabel(self, text=f"{APP_NAME} v{APP_VERSION}\n{APP_CREDIT}",
                      text_color=CLR_MUTED, justify="center",
                      font=ctk.CTkFont(size=11)).pack(side="bottom", pady=10)
@@ -7181,10 +7186,20 @@ class SettingsWindow(ctk.CTkToplevel):
         new = "en" if value == "EN" else "ru"
         if new == LANG:
             return
+        if self.app.busy_section() is not None:
+            self.app.busy_section().show_toast(t("other_task_running"), "warn")
+            self.lang_seg.set("EN" if LANG == "en" else "RU")
+            return
+        # Collect stable preset keys before switching the translated labels.
+        for section in self.app._sections.values():
+            if hasattr(section, "_collect"):
+                data = section._collect()
+                if isinstance(data, dict):
+                    save_settings(data)
         set_lang(new)
-        s = load_settings()
-        s["lang"] = new
-        save_settings(s)
+        settings = load_settings()
+        settings["lang"] = new
+        save_settings(settings)
         self.destroy()
         self.app.rebuild()
 
@@ -7194,9 +7209,9 @@ class SettingsWindow(ctk.CTkToplevel):
         s = load_settings()
         s["theme"] = mode
         save_settings(s)
-        cur = self.app.current
-        if cur is not None and hasattr(cur, "restyle"):
-            cur.restyle()
+        for section in self.app._sections.values():
+            if hasattr(section, "restyle"):
+                section.restyle()
 
     def _on_sound(self):
         s = load_settings()
@@ -7234,6 +7249,12 @@ class App(TkinterDnD.DnDWrapper, ctk.CTk):
         self.minsize(1000, 680)
         restore_window_geo("main", self, 1140, 750)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        app_closing.clear()
+        stop_flag.clear()
+        self._sections = {}
+        self._saved_files = {}
+        self._tasks = set()
+        self._task_lock = threading.Lock()
         self.current = None
         self._current_name = ""
         self.SECTIONS = {
@@ -7271,12 +7292,12 @@ class App(TkinterDnD.DnDWrapper, ctk.CTk):
             self.after(450, lambda: self.route_paths(_CLI_PATHS))
 
     def _on_sys_appearance(self, _mode):
-        try:
-            cur = self.current
-            if cur is not None and hasattr(cur, "restyle"):
-                cur.restyle()
-        except Exception:
-            pass
+        for section in self._sections.values():
+            if hasattr(section, "restyle"):
+                try:
+                    section.restyle()
+                except Exception as error:
+                    _log_exc("restyle", error)
 
     def _set_app_icon(self):
         """Фирменная иконка окна/панели задач: бирюзовая плитка с N."""
@@ -7407,62 +7428,95 @@ class App(TkinterDnD.DnDWrapper, ctk.CTk):
         if name == self._current_name and self.current is not None:
             return
         if self.current is not None:
-            try:
-                if hasattr(self.current, "on_leave"):
-                    self.current.on_leave()
-            except Exception as e:
-                _log_exc("on_leave", e)
-            try:
-                self.current.destroy()
-            except Exception as e:
-                _log_exc("section destroy", e)
-            self.current = None
+            self.current.pack_forget()
         self._current_name = name
         self._update_nav()
-        self.current = self.SECTIONS[name](self)
+        if name not in self._sections:
+            self._sections[name] = self.SECTIONS[name](self)
+            saved = self._saved_files.pop(name, [])
+            if saved and hasattr(self._sections[name], "add_paths"):
+                self._sections[name].add_paths(saved)
+        self.current = self._sections[name]
         self.current.pack(fill="both", expand=True)
-        try:
-            s = load_settings()
-            s["last_section"] = name
-            save_settings(s)
-        except Exception:
-            pass
+        for key in ("<Control-Return>", "<Delete>", "<Control-o>", "<Escape>"):
+            self.unbind(key)
+        if hasattr(self.current, "_ev"):
+            self.bind("<Control-Return>", self.current._ev(self.current._start))
+            self.bind("<Delete>", self.current._ev(self.current._remove))
+            self.bind("<Control-o>", self.current._ev(self.current._add))
+        self.bind("<Escape>", lambda event: self._cancel_current_task())
+        settings = load_settings()
+        settings["last_section"] = name
+        save_settings(settings)
+
+    def busy_section(self):
+        return next((section for section in self._sections.values()
+                     if getattr(section, "is_running", False) or getattr(section, "_preview_busy", False)
+                     or getattr(section, "_recovery_busy", False) or getattr(section, "_edit_busy", False)), None)
+
+    def _cancel_current_task(self):
+        section = self.busy_section() or self.current
+        if section is not None and hasattr(section, "_stop"):
+            section._stop()
 
     def rebuild(self):
-        """Полная пересборка UI (например, после смены языка)."""
+        if self.busy_section() is not None:
+            return
         name = self._current_name or "pdf"
-        if self.current is not None:
+        for key, section in self._sections.items():
+            self._saved_files[key] = list(getattr(section, "files", []))
             try:
-                self.current.on_leave()
-            except Exception:
-                pass
-            try:
-                self.current.destroy()
-            except Exception:
-                pass
-            self.current = None
-            self._current_name = ""
-        try:
-            self.sidebar.destroy()
-            self.content.destroy()
-        except Exception as e:
-            _log_exc("rebuild destroy", e)
+                if hasattr(section, "on_leave"):
+                    section.on_leave()
+                section.destroy()
+            except Exception as error:
+                _log_exc("rebuild section", error)
+        self._sections.clear()
+        self.current = None
+        self._current_name = ""
+        self.sidebar.destroy()
+        self.content.destroy()
         self._build_shell()
         self.show(name)
 
     def _on_close(self):
-        stop_flag.set()
-        try:
-            kill_active_processes()
-        except Exception:
-            pass
-        if self.current is not None and hasattr(self.current, "on_leave"):
-            try:
-                self.current.on_leave()
-            except Exception:
-                pass
+        if app_closing.is_set():
+            return
         save_window_geo("main", self)
-        cleanup_temp()
+        app_closing.set()
+        stop_flag.set()
+        self.title(t("closing"))
+        for section in self._sections.values():
+            try:
+                if hasattr(section, "on_leave"):
+                    section.on_leave()
+            except Exception as error:
+                _log_exc("close section", error)
+        kill_active_processes()
+        self.after(40, self._finish_close)
+
+    def _finish_close(self):
+        with self._task_lock:
+            pending = any(thread.is_alive() for thread in self._tasks)
+        if pending:
+            self.after(50, self._finish_close)
+            return
+        # No writer remains: cleanup cannot race with a late scan/JPEG save.
+        try:
+            ScanSessionStore.clear()
+            with history_lock:
+                unlink_owned(HISTORY_FILE)
+            cleanup_stage_journal(TEMP_DIR)
+            remove_owned_tree(TEMP_DIR)
+        except OSError as error:
+            self._cleanup_tries = getattr(self, "_cleanup_tries", 0) + 1
+            if self._cleanup_tries < 10:
+                self.after(200, self._finish_close)
+                return
+            _log_exc("close cleanup", error)
+        self._saved_files.clear()
+        self._sections.clear()
+        self.current = None
         self.destroy()
 
     # ---- Drag & Drop на уровне root ----
@@ -7559,12 +7613,19 @@ class App(TkinterDnD.DnDWrapper, ctk.CTk):
 
 def main():
     cleanup_stale_temp()
+    ScanSessionStore.prepare()
     App().mainloop()
 
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    main()
+    if _PDF_WORKER_MODE:
+        try:
+            nexus_workers.serve(sys.modules[__name__], sys.argv[sys.argv.index("--nexus-pdf-worker") + 1])
+        except (OSError, ValueError):
+            pass
+    else:
+        main()
 
 
 

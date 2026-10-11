@@ -13,6 +13,7 @@ jobs:
       PYTHONUTF8: '1'
       PYTHONUNBUFFERED: '1'
       NEXUS_MULTI: '1'
+      NEXUS_VERIFY_SCREENSHOTS: artifacts/screenshots
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -70,6 +71,15 @@ jobs:
             $lines = & "$installed/_internal/scan/NexusScan$arch.exe" layout | Out-String
             if ($LASTEXITCODE -ne 0 -or $lines -notmatch '"layout","ok":true') { throw "Installed worker $arch failed" }
           }
+          $sessionRoot = Join-Path $env:RUNNER_TEMP 'nexus-installed-session'
+          New-Item -ItemType Directory -Force -Path $sessionRoot | Out-Null
+          $env:APPDATA = Join-Path $sessionRoot 'roaming'
+          $env:LOCALAPPDATA = Join-Path $sessionRoot 'local'
+          & .venv/Scripts/python.exe tests/test_lifecycle.py --scenario seed --root $sessionRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Installed scan-session fixture failed' }
+          $exportHash = (Get-FileHash (Join-Path $sessionRoot 'exported.png')).Hash
+          & .venv/Scripts/python.exe tests/test_packaged.py --exe "$installed/NexusOptimizer.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Installed PDF worker check failed' }
           $app = Start-Process "$installed/NexusOptimizer.exe" -PassThru
           try {
             for ($i = 0; $i -lt 100; $i++) {
@@ -80,11 +90,18 @@ jobs:
             }
             if ($app.MainWindowTitle -notlike 'Nexus Optimizer*') { throw 'Installed main window did not open' }
             Write-Host "Installed app opened: $($app.MainWindowTitle)"
+            Start-Sleep -Milliseconds 600
+            & .venv/Scripts/python.exe -c "from PIL import ImageGrab; ImageGrab.grab().save('artifacts/screenshots/installed.png')"
             $null = $app.CloseMainWindow()
             if (-not $app.WaitForExit(15000)) { throw 'Installed app did not close normally' }
           } finally {
             if (-not $app.HasExited) { $app.Kill() }
           }
+          $scanRoot = Join-Path $env:LOCALAPPDATA 'NexusOptimizer/ScanSession'
+          if (@(Get-ChildItem $scanRoot -Directory -ErrorAction SilentlyContinue).Count) { throw 'Installed GUI left scan session after normal close' }
+          if (Test-Path (Join-Path $env:APPDATA 'NexusOptimizer/history.json')) { throw 'Installed GUI left session history' }
+          if ((Get-FileHash (Join-Path $sessionRoot 'exported.png')).Hash -ne $exportHash) { throw 'Installed GUI damaged external export' }
+          Write-Host 'Installed scan-session cleanup and external export verified'
           $installer = New-Object -ComObject WindowsInstaller.Installer
           $database = $installer.OpenDatabase((Resolve-Path artifacts/NexusOptimizer.msi).Path, 0)
           $view = $database.OpenView("SELECT Value FROM Property WHERE Property = 'ProductCode'")
@@ -110,5 +127,36 @@ jobs:
           path: |
             build-verification.log
             artifacts/SHA256SUMS.txt
+            artifacts/screenshots/*.png
           if-no-files-found: warn
           retention-days: 30
+
+  release:
+    needs: windows
+    if: contains(github.event.head_commit.message, '[release]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: NexusOptimizer-Setup
+          path: delivered
+      - uses: actions/download-artifact@v4
+        with:
+          name: nexusoptimizer-verification
+          path: verification
+      - name: Publish the verified single installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd delivered
+          sha256sum --check ../verification/artifacts/SHA256SUMS.txt
+          cd ..
+          version=$(python -c 'import re; print(re.search(r"APP_VERSION\s*=\s*\"([0-9.]+)\"", open("NexusPDFOptimizer.py", encoding="utf-8").read())[1])')
+          tag="v$version"
+          gh release create "$tag" "delivered/NexusOptimizer-Setup-$version.exe" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Nexus Optimizer $version" --notes-file "CHANGELOG-$version.md" --draft
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest

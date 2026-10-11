@@ -96,6 +96,13 @@ $env:NEXUS_SCAN_HELPERS = Join-Path $PSScriptRoot "scanner\out-test"
 $scanRc = $LASTEXITCODE
 $env:NEXUS_SCAN_HELPERS = $null
 if ($scanRc -ne 0) { Fail "scanner tests failed" }
+& ".\.venv\Scripts\python.exe" "tests\test_optimizer_310.py"
+if ($LASTEXITCODE -ne 0) { Fail "media/session regression tests failed" }
+& ".\.venv\Scripts\python.exe" "tests\test_lifecycle.py"
+if ($LASTEXITCODE -ne 0) { Fail "GUI/cleanup lifecycle tests failed" }
+& ".\.venv\Scripts\python.exe" "tests\test_packaged.py" --exe (Join-Path $payload "NexusOptimizer.exe")
+if ($LASTEXITCODE -ne 0) { Fail "windowed executable PDF worker tests failed" }
+
 
 # ---- 3. licence and notices shipped next to the program ----
 Step 3 "Licence and notices"
