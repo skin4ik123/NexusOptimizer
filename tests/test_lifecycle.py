@@ -47,6 +47,9 @@ def scenario(name, root):
     def screenshot(app, label):
         folder = os.environ.get("NEXUS_VERIFY_SCREENSHOTS")
         if folder and os.name == "nt":
+            assert pump(app, lambda: app.winfo_ismapped() and app.winfo_width() >= 400), "Screenshot window is not visible"
+            app.lift()
+            app.update()
             app.update_idletasks()
             target = Path(folder)
             target.mkdir(parents=True, exist_ok=True)

@@ -114,6 +114,36 @@ def test_palette_greyscale_alpha_and_16bit_png_are_preserved():
         assert nx.process_image(str(source), str(root / "depth.jpg"), 75, 0, "JPEG", False)[2] == "err_bit_depth"
 
 
+def test_plain_scan_jpeg_keeps_bytes_dpi_and_white_background():
+    with StoreFixture() as root:
+        jpeg = root / "original.jpg"
+        exif = Image.Exif()
+        exif[274] = 6
+        photo((120, 180)).save(jpeg, quality=60, dpi=(300, 300), exif=exif)
+        original = jpeg.read_bytes()
+        exported = root / "exported.jpg"
+        assert nx.ScanSection._plain_jpg(str(jpeg), str(exported))
+        assert exported.read_bytes() == original and jpeg.read_bytes() == original
+        png = root / "scan.png"
+        photo((100, 140)).save(png, dpi=(300, 300))
+        assert nx.ScanSection._plain_jpg(str(png), str(exported))
+        with Image.open(exported) as actual:
+            assert round(actual.info["dpi"][0]) == 300
+        pdf = root / "scan.pdf"
+        assert nx.images_to_pdf([str(exported)], str(pdf))[0]
+        with nx.fitz.open(pdf) as document:
+            assert abs(document[0].rect.width - 24) < 0.1
+            assert abs(document[0].rect.height - 33.6) < 0.1
+        transparent = Image.new("RGBA", (100, 140), (0, 0, 0, 0))
+        transparent.save(png, dpi=(300, 300))
+        assert nx.ScanSection._plain_jpg(str(png), str(exported))
+        with Image.open(exported) as actual:
+            assert min(actual.getpixel((20, 20))) >= 250
+        nx.stop_flag.set()
+        assert not nx.ScanSection._plain_jpg(str(png), str(exported))
+        nx.stop_flag.clear()
+
+
 def test_faint_ink_is_not_blank_or_erased_by_bw():
     image = Image.new("L", (800, 1100), 245)
     draw = ImageDraw.Draw(image)

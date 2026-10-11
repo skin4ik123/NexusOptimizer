@@ -61,7 +61,7 @@ from nexus_recovery import RecoveryWindow
 _PDF_WORKER_MODE = "--nexus-pdf-worker" in sys.argv
 
 APP_NAME = "Nexus Optimizer"
-APP_VERSION = "3.10.0"
+APP_VERSION = "3.10.1"
 APP_AUTHOR = "Artur Yurchuk"
 APP_CREDIT = f"Crafted by {APP_AUTHOR}"
 
@@ -6874,16 +6874,28 @@ class ScanSection(BaseSection):
             return False
         try:
             image = ScanSessionStore.open_image(src)
-            if image.mode not in ("L", "RGB"):
+            with Image.open(src) as original:
+                copy_jpeg = original.format == "JPEG" and not ScanSessionStore.rotation(src)
+            extra = {"dpi": image.info["dpi"]} if image.info.get("dpi") else {}
+            if image.mode in ("RGBA", "LA", "P", "PA"):
+                rgba = image.convert("RGBA")
+                image = Image.new("RGB", rgba.size, "white")
+                image.paste(rgba, mask=rgba.getchannel("A"))
+            elif image.mode not in ("L", "RGB"):
                 image = image.convert("RGB")
             with AtomicOutput(out, TEMP_DIR, stop_flag) as stage:
-                image.save(stage.path, "JPEG", quality=92, optimize=True)
+                if copy_jpeg:
+                    shutil.copy2(src, stage.path)
+                else:
+                    image.save(stage.path, "JPEG", quality=92, optimize=True, **extra)
                 with Image.open(stage.path) as check:
                     check.load()
-                    if check.size != image.size:
+                    if ImageOps.exif_transpose(check).size != image.size:
                         return False
                 stage.commit()
             return True
+        except ProcessingCancelled:
+            return False
         except Exception as error:
             _log_exc("export scan JPEG", error)
             return False
