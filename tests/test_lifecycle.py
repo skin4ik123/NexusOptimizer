@@ -57,6 +57,17 @@ def scenario(name, root):
                                 app.winfo_rootx() + app.winfo_width(),
                                 app.winfo_rooty() + app.winfo_height())).save(target / (label + ".png"))
 
+    def visible_controls(window, control=None):
+        assert pump(window, lambda: window.winfo_ismapped() and window.winfo_width() >= 400)
+        left, top, right, bottom = nx._window_workarea(window)
+        x, y = window.winfo_rootx(), window.winfo_rooty()
+        assert left <= x and top <= y, (x, y, left, top)
+        assert x + window.winfo_width() <= right, "Window extends beyond monitor"
+        assert y + window.winfo_height() <= bottom, "Window is covered by the taskbar"
+        if control is not None:
+            assert control.winfo_ismapped(), "Action control is hidden"
+            assert control.winfo_rooty() + control.winfo_height() <= min(bottom, y + window.winfo_height()), "Action control is clipped"
+
     nx.ScanSessionStore.prepare()
     if name == "reopen":
         assert nx.ScanSessionStore.load() == []
@@ -87,6 +98,10 @@ def scenario(name, root):
         nx.add_history({"mode": "Scan", "count": 1, "saved_mb": 1, "folder": str(root)})
         print("Seeded interrupted scan session and external export", flush=True)
         return
+    if name == "normal-close":
+        settings = nx.load_settings()
+        settings["window_geo"] = {"main": "1400x1000+900+600"}
+        nx.save_settings(settings)
     app = nx.App()
     app.show("img")
     section = app.current
@@ -128,6 +143,7 @@ def scenario(name, root):
         window._load(1)
         assert pump(app, lambda: window.images is not None, 60), window.status.cget("text")
         assert window.page.get() == "2"
+        visible_controls(window, window.page_menu)
         screenshot(window, "comparison")
         window._close()
         app.show("scan")
@@ -158,15 +174,19 @@ def scenario(name, root):
     app.show("pdf")
     app.current.add_paths([str(pdf)])
     app.current.target_var.set("5")
+    visible_controls(app, app.current.btn)
     screenshot(app, "pdf")
     app.show("img")
     assert app.current is section and app.current.files == [str(source)]
+    visible_controls(app, section.btn)
     screenshot(app, "photos")
     app.show("vid")
     app.current.metadata_var.set(False)
+    visible_controls(app, app.current.btn)
     screenshot(app, "video")
     app.show("scan")
     assert app.current.pages == [str(scan)]
+    visible_controls(app, app.current.scan_btn)
     screenshot(app, "scanner")
     nx.add_history({"mode": "Image", "count": 1, "saved_mb": 1, "folder": str(root)})
     nx.TEMP_DIR.mkdir(parents=True, exist_ok=True)

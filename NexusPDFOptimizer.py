@@ -61,7 +61,7 @@ from nexus_recovery import RecoveryWindow
 _PDF_WORKER_MODE = "--nexus-pdf-worker" in sys.argv
 
 APP_NAME = "Nexus Optimizer"
-APP_VERSION = "3.10.1"
+APP_VERSION = "3.10.2"
 APP_AUTHOR = "Artur Yurchuk"
 APP_CREDIT = f"Crafted by {APP_AUTHOR}"
 
@@ -1472,56 +1472,98 @@ def save_window_geo(key: str, win):
         _log_exc("save_window_geo", e)
 
 
-def restore_window_geo(key: str, win, default_w: int, default_h: int):
-    """Восстановить окно; если нет записи или уехало за экран — по центру."""
+def _window_workarea(win, position=None):
+    """Physical monitor coordinates, excluding the taskbar on Windows."""
+    fallback = (0, 0, win.winfo_screenwidth(), win.winfo_screenheight())
+    if os.name != "nt":
+        return fallback
     try:
-        s = load_settings()
-        geos = s.get("window_geo") or {}
+        from ctypes import wintypes
+        class MonitorInfo(ctypes.Structure):
+            _fields_ = [("size", wintypes.DWORD), ("monitor", wintypes.RECT),
+                        ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
+        user = ctypes.windll.user32
+        if position is None:
+            get_monitor = user.MonitorFromWindow
+            get_monitor.argtypes = [wintypes.HWND, wintypes.DWORD]
+            get_monitor.restype = wintypes.HANDLE
+            monitor = get_monitor(win.winfo_id(), 2)
+        else:
+            x, y = position
+            rect = wintypes.RECT(x, y, x + 1, y + 1)
+            get_monitor = user.MonitorFromRect
+            get_monitor.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
+            get_monitor.restype = wintypes.HANDLE
+            monitor = get_monitor(ctypes.byref(rect), 2)
+        info = MonitorInfo()
+        info.size = ctypes.sizeof(info)
+        get_info = user.GetMonitorInfoW
+        get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+        get_info.restype = wintypes.BOOL
+        if get_info(monitor, ctypes.byref(info)):
+            return info.work.left, info.work.top, info.work.right, info.work.bottom
+    except Exception as error:
+        _log_exc("window work area", error)
+    return fallback[0], fallback[1], fallback[2], max(1, fallback[3] - 48)
+
+
+def _place_window(win, width, height, x=None, y=None):
+    """Fit client size, minimum size and window decorations to its monitor."""
+    win.update_idletasks()
+    scale = float(win._get_window_scaling()) if hasattr(win, "_get_window_scaling") else 1.0
+    left, top, right, bottom = _window_workarea(win, None if x is None else (x, y))
+    # Geometry sizes are logical in CTk, while monitor positions are physical.
+    # Reserve titlebar/frame space before positioning the actual requested size.
+    max_w = max(100, int((right - left) / scale) - 24)
+    max_h = max(100, int((bottom - top) / scale) - 48)
+    minimum = tuple(map(int, win.tk.call("wm", "minsize", win._w)))
+    min_w = min(max_w, max(1, int(minimum[0] / scale)))
+    min_h = min(max_h, max(1, int(minimum[1] / scale)))
+    win.minsize(min_w, min_h)
+    width = max(min_w, min(int(width), max_w))
+    height = max(min_h, min(int(height), max_h))
+    outer_w = round((width + 16) * scale)
+    outer_h = round((height + 40) * scale)
+    x = (left + right - outer_w) // 2 if x is None else int(x)
+    y = (top + bottom - outer_h) // 2 if y is None else int(y)
+    x = max(left, min(x, right - outer_w))
+    y = max(top, min(y, bottom - outer_h))
+    win.geometry(f"{width}x{height}+{x}+{y}")
+    win.update_idletasks()
+
+
+def restore_window_geo(key: str, win, default_w: int, default_h: int):
+    """Restore a window while keeping the entire window in its monitor's work area."""
+    try:
+        settings = load_settings()
+        geos = settings.get("window_geo") or {}
         geo = geos.get(key) if isinstance(geos, dict) else None
-        if geo and isinstance(geo, str) and "x" in geo:
-            m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", geo)
-            if m:
-                w, h, x, y = map(int, m.groups())
-                sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-                w = max(300, min(w, sw))
-                h = max(300, min(h, sh))
-                if x + 80 > sw or y + 80 > sh or x < -50 or y < -50:
-                    center_window(win, w, h)
-                else:
-                    win.geometry(f"{w}x{h}+{x}+{y}")
+        if isinstance(geo, str):
+            match = re.fullmatch(r"(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)", geo)
+            if match:
+                width, height = map(int, match.groups()[:2])
+                x, y = (int(value.replace("+-", "-")) for value in match.groups()[2:])
+                _place_window(win, width, height, x, y)
                 return
         center_window(win, default_w, default_h)
-    except Exception as e:
-        _log_exc("restore_window_geo", e)
-        try:
-            center_window(win, default_w, default_h)
-        except Exception:
-            pass
+    except Exception as error:
+        _log_exc("restore_window_geo", error)
+        center_window(win, default_w, default_h)
+
 
 
 def center_window(win, width: int = None, height: int = None):
-    """Центрировать окно по рабочему столу."""
+    """Center a window inside the current monitor's available work area."""
     try:
-        win.update_idletasks()
         if width is None or height is None:
-            geo = win.geometry().split("+")[0]
-            w_s, h_s = geo.split("x")
-            width = width or int(float(w_s))
-            height = height or int(float(h_s))
-        sw = win.winfo_screenwidth()
-        sh = win.winfo_screenheight()
-        max_w = int(sw * 0.92)
-        max_h = int(sh * 0.88)
-        width = min(width, max_w)
-        height = min(height, max_h)
-        x = max(0, (sw - width) // 2)
-        y = max(0, (sh - height) // 2)
-        if y + height > sh - 48:  # панель задач
-            y = max(0, sh - height - 48)
-        win.geometry(f"{int(width)}x{int(height)}+{int(x)}+{int(y)}")
-        win.update_idletasks()
-    except Exception:
-        pass
+            dimensions = win.geometry().split("+")[0].split("-")[0]
+            current_w, current_h = map(int, dimensions.split("x"))
+            width = width or current_w
+            height = height or current_h
+        _place_window(win, width, height)
+    except Exception as error:
+        _log_exc("center_window", error)
+
 
 # -------------------- константы / пути --------------------
 
