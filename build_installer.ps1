@@ -100,6 +100,8 @@ if ($scanRc -ne 0) { Fail "scanner tests failed" }
 if ($LASTEXITCODE -ne 0) { Fail "media/session regression tests failed" }
 & ".\.venv\Scripts\python.exe" "tests\test_lifecycle.py"
 if ($LASTEXITCODE -ne 0) { Fail "GUI/cleanup lifecycle tests failed" }
+& ".\.venv\Scripts\python.exe" "tests\test_pages_ui.py"
+if ($LASTEXITCODE -ne 0) { Fail "scanner page grid / file list tests failed" }
 & ".\.venv\Scripts\python.exe" "tests\test_packaged.py" --exe (Join-Path $payload "NexusOptimizer.exe")
 if ($LASTEXITCODE -ne 0) { Fail "windowed executable PDF worker tests failed" }
 

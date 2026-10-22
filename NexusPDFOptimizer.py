@@ -61,7 +61,7 @@ from nexus_recovery import RecoveryWindow
 _PDF_WORKER_MODE = "--nexus-pdf-worker" in sys.argv
 
 APP_NAME = "Nexus Optimizer"
-APP_VERSION = "3.10.2"
+APP_VERSION = "3.11.0"
 APP_AUTHOR = "Artur Yurchuk"
 APP_CREDIT = f"Crafted by {APP_AUTHOR}"
 
@@ -876,6 +876,7 @@ try:
     HAS_TKDND = True
 except ImportError:
     HAS_TKDND = False
+    DND_FILES = "DND_Files"
 
     class TkinterDnD:  # заглушка для наследования App
         class DnDWrapper:
@@ -939,7 +940,7 @@ TRANSLATIONS = {
         "scan_deskew": "Выравнивать перекошенные страницы",
         "scan_skip_blank": "Пропускать пустые листы (автоподатчик)",
         "scan_select_all": "Выбрать все",
-        "scan_help": "1) Выберите сканер и параметры слева\n2) «Сканировать» — страницы появляются по мере сканирования\n3) Щелчок выбирает страницу, перетаскивание меняет порядок, ↺ ↻ поворачивают\n4) Сохраните одним PDF или картинками JPG. Экспортируйте нужные страницы перед закрытием",
+        "scan_help": "1) Выберите сканер и параметры слева\n2) «Сканировать» — страницы появляются по мере сканирования\n3) Щелчок выбирает страницу (Ctrl — добавить, Shift — диапазон, Ctrl+A — все), ↺ ↻ на карточке поворачивают её. Перетаскивание меняет порядок, за окно — экспортирует страницы\n4) Сохраните одним PDF или картинками JPG. Экспортируйте нужные страницы перед закрытием",
         "scan_searching": "Поиск сканеров…",
         "scan_found": "Найдено сканеров: {n}",
         "scan_no_devices": "Сканеры не найдены. Включите сканер, проверьте кабель или сеть и нажмите «Обновить список».",
@@ -1182,7 +1183,7 @@ TRANSLATIONS = {
         "scan_deskew": "Straighten skewed pages",
         "scan_skip_blank": "Skip blank sheets (feeder)",
         "scan_select_all": "Select all",
-        "scan_help": "1) Pick a scanner and settings on the left\n2) Scan — pages appear as they are scanned\n3) Click selects a page, drag reorders, ↺ ↻ rotate\n4) Save as one PDF or as JPG images. Export the pages you want to keep before closing",
+        "scan_help": "1) Pick a scanner and settings on the left\n2) Scan — pages appear as they are scanned\n3) Click selects a page (Ctrl adds, Shift selects a range, Ctrl+A all), ↺ ↻ on a card rotate it. Drag to reorder, drag out of the window to export pages\n4) Save as one PDF or as JPG images. Export the pages you want to keep before closing",
         "scan_searching": "Looking for scanners…",
         "scan_found": "Scanners found: {n}",
         "scan_no_devices": "No scanners found. Turn the scanner on, check the cable or network and click Refresh list.",
@@ -2367,7 +2368,9 @@ def move_to_original(path: str) -> bool:
         return False
 
 
-def finalize_output(inp: str, out: str, move: bool) -> bool:
+def finalize_output(inp: str, out: str, move: bool) -> Tuple[bool, str]:
+    """Убрать исходник в сторону и опубликовать результат.
+    Возвращает (исходник сохранён, фактический путь результата)."""
     preserved = move_to_original(inp) if move else protect_original(inp)
     if out and ".__nexus_tmp__" in out and os.path.isfile(out):
         final = out.replace(".__nexus_tmp__", "")
@@ -2378,9 +2381,10 @@ def finalize_output(inp: str, out: str, move: bool) -> bool:
             final = unique_out_path(stem + "_nexus" + extension)
         try:
             os.rename(out, final)
+            out = final
         except OSError as error:
             _log_exc("publish completed result", error)
-    return preserved
+    return preserved, out
 
 
 def merge_pdfs(paths: List[str], output_pdf: str, progress_cb=None):
@@ -3032,13 +3036,13 @@ def finalize_scan_page(src: str, dst_dir: Path, want_color: str, deskew: bool,
                 "recovery_path": raw, "error": str(error)[:120]}
 
 
-def rotate_page_file(path: str, degrees: int, dst_dir: Path) -> str:
+def rotate_page_file(path: str, degrees: int, dst_dir: Path, cancellable: bool = True) -> str:
     """Record rotation, keeping the received image bytes unchanged."""
     if not ScanSessionStore.owns(path):
         dst_dir = Path(dst_dir)
         dst_dir.mkdir(parents=True, exist_ok=True)
         copied = str(dst_dir / f"page_{time.time_ns()}{Path(path).suffix}")
-        copy_atomic(path, copied, TEMP_DIR, stop_flag)
+        copy_atomic(path, copied, TEMP_DIR, stop_flag if cancellable else None)
         path = copied
     ScanSessionStore.rotate(path, degrees)
     return path
@@ -4199,6 +4203,8 @@ class BaseSection(ctk.CTkFrame):
                 elif k == "file_all":
                     for p in item[1]:
                         self._set_row_state(p, "queued", None)
+                elif k == "file_result":
+                    self._retarget_row(item[1], item[2])
                 elif k == "run_summary":
                     done, total, saved = item[1], item[2], item[3]
                     lbl = getattr(self, "summary_lbl", None)
@@ -4492,12 +4498,13 @@ class BaseSection(ctk.CTkFrame):
         chip.grid(row=0, column=3, rowspan=2, padx=(4, 10))
         bar = ctk.CTkProgressBar(r, width=112, height=5, progress_color=CLR_ACC)
         bar.set(0)
-        self._rows[path] = {"frame": r, "name": name, "meta": meta,
-                            "right": right, "chip": chip, "bar": bar,
-                            "icon": icon_lbl, "state": "new"}
+        rd = self._rows[path] = {"frame": r, "name": name, "meta": meta,
+                                 "right": right, "chip": chip, "bar": bar,
+                                 "icon": icon_lbl, "state": "new", "path": path}
         for w in (r, icon_lbl, name, meta, right, chip):
             try:
-                w.bind("<Button-1>", lambda e, p=path: self._row_click(p))
+                # путь берётся из строки: после сжатия он меняется на результат
+                w.bind("<Button-1>", lambda e, row=rd: self._row_click(row["path"]))
             except Exception:
                 pass
         # миниатюра для изображений — асинхронно, с кэшем
@@ -4623,6 +4630,45 @@ class BaseSection(ctk.CTkFrame):
             rd["state"] = state
         except Exception as e:
             _log_exc("row state", e)
+
+    def _retarget_row(self, old: str, new: str):
+        """Строка списка переходит с исходника на готовый результат."""
+        new = os.path.normpath(new)
+        if old == new or old not in self.files:
+            return
+        if new in self.files:
+            # результат уже в списке отдельной строкой — дубль не нужен
+            self._selected.discard(old)
+            rd = self._rows.pop(old, None)
+            if rd:
+                try:
+                    rd["frame"].destroy()
+                except Exception:
+                    pass
+            self.files.remove(old)
+            self._update_count()
+            return
+        self.files[self.files.index(old)] = new
+        for table in (self._rows, self._added_seq, self._thumb_cache):
+            if old in table:
+                table[new] = table.pop(old)
+        self._sizes.pop(old, None)
+        try:
+            self._sizes[new] = os.path.getsize(new)
+        except OSError:
+            self._sizes[new] = 0
+        if old in self._selected:
+            self._selected.discard(old)
+            self._selected.add(new)
+        rd = self._rows.get(new)
+        if not rd:
+            return
+        rd["path"] = new
+        try:
+            rd["name"].configure(text=os.path.basename(new))
+            rd["meta"].configure(text=os.path.dirname(new))
+        except Exception as e:
+            _log_exc("retarget row", e)
 
     def _build_bottom(self, start_text: str, color: str = None, hint: str = ""):
         """Панель-сводка: слева итог по файлам, справа одна главная кнопка.
@@ -4817,7 +4863,14 @@ class BaseSection(ctk.CTkFrame):
         save_settings(self._collect())
         self.settings = load_settings()
         stop_flag.clear()
-        snapshot = self._preflight_files(list(self.files))
+        # Уже сжатые строки указывают на результат: второй проход сжал бы
+        # результат ещё раз и убрал бы его в original/.
+        pending = [p for p in self.files
+                   if self._rows.get(p, {}).get("state") not in ("done", "warn")]
+        if not pending:
+            self.show_toast(t("all_processed"), "warn")
+            return
+        snapshot = self._preflight_files(pending)
         if not snapshot:
             return
         outdir = self._outdir()
@@ -4887,8 +4940,15 @@ class BaseSection(ctk.CTkFrame):
                 q.put(("log", f"✓ {os.path.basename(inp)}  {human_size(orig)} → {human_size(new)}"))
                 if warning:
                     q.put(("log", "⚠ " + t("target_missed")))
-                if not outdir and finalize_output(inp, hint, move):
-                    moved += 1
+                result_path = hint
+                if not outdir:
+                    preserved, result_path = finalize_output(inp, hint, move)
+                    moved += int(preserved)
+                # Исходник убран в original/ или переименован: строка списка
+                # теперь означает результат, иначе «Объединить в PDF» и
+                # «Сравнить» искали бы файл, которого уже нет.
+                if os.path.isfile(result_path):
+                    q.put(("file_result", inp, result_path))
             elif message == "err_no_gain":
                 unchanged += 1
                 q.put(("file", inp, "unchanged", None))
@@ -5118,7 +5178,9 @@ class PdfSection(BaseSection):
             return
         out = filedialog.asksaveasfilename(defaultextension=".pdf",
                                            filetypes=[("PDF", "*.pdf")],
-                                           title=t("merge_pdf"))
+                                           title=t("merge_pdf"),
+                                           initialdir=os.path.dirname(self.files[0]),
+                                           initialfile="merged.pdf")
         if not out:
             return
         self.is_running = True
@@ -5401,7 +5463,10 @@ class ImageSection(BaseSection):
             self.show_toast(t("no_files"), "warn")
             return
         out = filedialog.asksaveasfilename(defaultextension=".pdf",
-                                           filetypes=[("PDF", "*.pdf")])
+                                           filetypes=[("PDF", "*.pdf")],
+                                           title=t("merge_pdf"),
+                                           initialdir=os.path.dirname(self.files[0]),
+                                           initialfile="photos.pdf")
         if not out:
             return
         self.is_running = True
@@ -5746,6 +5811,18 @@ class VideoSection(BaseSection):
             single_fn=single,
         )
 
+class _DetachedContext:
+    """Модуль программы с собственным флагом остановки: короткий экспорт
+    (перетаскивание страниц) не прерывается «Стопом» другой задачи и сам
+    его не сбрасывает."""
+
+    def __init__(self):
+        self.stop_flag = threading.Event()
+
+    def __getattr__(self, name):
+        return getattr(sys.modules[__name__], name)
+
+
 class ScanSection(BaseSection):
     """
     Сканер: выбор устройства → свои настройки или окно драйвера → страницы
@@ -5772,6 +5849,15 @@ class ScanSection(BaseSection):
         self._recovery_window = None
         self._recovery_busy = False
         self._edit_busy = False
+        self._drag_out = None        # свои страницы, которые сейчас тянут мышью
+        self._hover_page = None      # карточка-цель под курсором
+        self._sel_anchor = None      # начало диапазона для Shift+щелчка
+        self._last_autoscroll = 0.0
+        self._card_backlog: list = []  # карточки, которые ещё предстоит создать
+        self._card_job = None
+        self._scroll_after_cards = False
+        # перетаскивание наружу — только когда tkdnd загружен
+        self._dnd_out = bool(HAS_TKDND and getattr(app, "TkdndVersion", None))
         super().__init__(app, "scanner")
         self._start_task(self._page_worker, name="scan-pages")
         self._refresh_pages_ui()
@@ -5883,6 +5969,14 @@ class ScanSection(BaseSection):
                         variable=self.open_after_var,
                         fg_color=CLR_ACC, hover_color=CLR_ACC_HOVER).pack(
             anchor="w", padx=10, pady=(6, 2))
+        self.drag_fmt_var = ctk.StringVar(value="PDF")
+        if self._dnd_out:
+            drag_row = ctk.CTkFrame(left, fg_color="transparent")
+            drag_row.pack(fill="x", padx=10, pady=(4, 2))
+            ctk.CTkLabel(drag_row, text=t("drag_format"), anchor="w").pack(side="left")
+            ctk.CTkOptionMenu(drag_row, variable=self.drag_fmt_var, values=["PDF", "JPG"],
+                              width=84, fg_color=CLR_GHOST, button_color=CLR_GHOST_HOVER,
+                              button_hover_color=CLR_ACC, text_color=CLR_GHOST_TEXT).pack(side="right")
 
         head(t("comp_settings"))
         self.compress_var = ctk.BooleanVar(value=True)
@@ -5936,6 +6030,7 @@ class ScanSection(BaseSection):
         # их не выдавливает за край
         br = ctk.CTkFrame(right, fg_color="transparent")
         br.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
+        # ↺ ↻ 180° — для выбранных; одну страницу крутят кнопки на карточке
         btn_ghost(br, text="", image=icon("rot_l", 20), width=44,
                   command=lambda: self._rotate_selected(90)).grid(row=0, column=0, padx=2, pady=2)
         btn_ghost(br, text="", image=icon("rot_r", 20), width=44,
@@ -5944,10 +6039,18 @@ class ScanSection(BaseSection):
                   command=self._select_all_pages).grid(row=0, column=2, padx=2, pady=2)
         btn_ghost(br, text=t("remove_sel"), width=130,
                   command=self._remove_pages).grid(row=0, column=3, padx=2, pady=2)
-        btn_ghost(br, text=t("clear_list"), width=120,
-                  command=self._clear_pages).grid(row=1, column=0, columnspan=2, padx=2, pady=2)
-        btn_ghost(br, text=t("restore_original"), width=210,
-                  command=self._restore_original).grid(row=1, column=2, columnspan=2, padx=2, pady=2)
+        btn_ghost(br, text="180°", width=92,
+                  command=lambda: self._rotate_selected(180)).grid(row=1, column=0, columnspan=2, padx=2, pady=2)
+        btn_ghost(br, text=t("clear_list"), width=110,
+                  command=self._clear_pages).grid(row=1, column=2, padx=2, pady=2)
+        btn_ghost(br, text=t("restore_original"), width=130,
+                  command=self._restore_original).grid(row=1, column=3, padx=2, pady=2)
+        if self._dnd_out:
+            # колонка с весом: в узком окне сжимается она, а не кнопки
+            br.grid_columnconfigure(4, weight=1)
+            ctk.CTkLabel(br, text=t("pages_dnd_hint"), text_color=CLR_MUTED,
+                         font=ctk.CTkFont(size=11), wraplength=240, justify="left",
+                         anchor="w").grid(row=0, column=4, rowspan=2, sticky="w", padx=(10, 0))
 
         # Страницы — сетка миниатюр: клик = выбор, перетаскивание = порядок
         self.pages_area = ctk.CTkScrollableFrame(right, fg_color=CLR_LIST_BG,
@@ -5958,7 +6061,12 @@ class ScanSection(BaseSection):
         self._drag = {"path": None, "moved": False, "x": 0, "y": 0}
         self._page_cols_cur = 5
         self._resize_job = None
-        self.pages_area.bind("<Configure>", self._on_pages_resize)
+        # add="+": свой <Configure> у CTkScrollableFrame обновляет область
+        # прокрутки. Без него миниатюры ниже края окна были недоступны.
+        self.pages_area.bind("<Configure>", self._on_pages_resize, add="+")
+        # щелчок по пустому месту сетки снимает выбор
+        self.pages_area.bind("<Button-1>", lambda _e: self._clear_selection(), add="+")
+        self.pages_area._parent_canvas.bind("<Button-1>", lambda _e: self._clear_selection(), add="+")
 
         self.pages_hint = ctk.CTkLabel(
             right, text=t("empty_pages_hint"), justify="center",
@@ -6250,13 +6358,13 @@ class ScanSection(BaseSection):
             self._apply_rotation(item[1])
         elif kind == "scan_recovered":
             self._recovery_busy = False
-            for path in item[1]:
-                if path not in self.pages:
-                    self.pages.append(path)
+            new = [path for path in dict.fromkeys(item[1]) if path not in self.pages]
+            self.pages.extend(new)
             restored = set(item[1])
             self._transient_recovery = [record for record in self._transient_recovery if record["path"] not in restored]
             ScanSessionStore.save(self.pages)
-            self._refresh_pages_ui()
+            self._queue_cards(new)
+            self._pages_changed()
             self._update_recovery()
             self.show_toast(t("restore_count").format(n=len(item[1])), "ok")
             if self._recovery_window is not None and self._recovery_window.winfo_exists():
@@ -6364,10 +6472,13 @@ class ScanSection(BaseSection):
         self.pages.append(path)
         ScanSessionStore.save(self.pages)
         try:
-            self._make_page_card(len(self.pages) - 1, path)
-            self.pages_count.configure(text=str(len(self.pages)))
+            if self._card_backlog:
+                self._queue_cards([path])
+            else:
+                self._make_page_card(len(self.pages) - 1, path)
+            self._update_count()
             self.pages_hint.place_forget()
-            self.after(30, lambda: self.pages_area._parent_canvas.yview_moveto(1.0))
+            self._scroll_pages_to_end()
         except Exception as e:
             _log_exc("scan page card", e)
         self._log(f"✓ {t('scan_page_n').format(n=len(self.pages))}")
@@ -6468,6 +6579,11 @@ class ScanSection(BaseSection):
                         return added
             except Exception as e:
                 _log_exc("tiff ingest", e)
+        key = os.path.normcase(os.path.abspath(path))
+        if any(os.path.normcase(os.path.abspath(p)) == key for p in self.pages):
+            # одна и та же картинка дважды — две неотличимые карточки
+            self._log("○ " + t("page_already_added").format(name=os.path.basename(path)))
+            return added
         self.pages.append(path)
         added.append(path)
         return added
@@ -6475,13 +6591,17 @@ class ScanSection(BaseSection):
     def add_paths(self, paths: List[str]):
         """DnD: перетащенные картинки становятся страницами."""
         added = 0
+        start = len(self.pages)
         ScanSessionStore.DIR.mkdir(parents=True, exist_ok=True)
         for p in paths:
             for f in collect_files(p, IMAGE_EXTS, False):
                 added += len(self._ingest_file(f))
         if added:
             ScanSessionStore.save(self.pages)
-            self._refresh_pages_ui()
+            # новые страницы — в конце: остальные карточки не пересоздаются
+            self._queue_cards(self.pages[start:])
+            self._pages_changed()
+            self._scroll_pages_to_end()
             self._log(f"+ {added}")
 
     def _page_cols(self) -> int:
@@ -6524,6 +6644,7 @@ class ScanSection(BaseSection):
 
     def _refresh_pages_ui(self):
         self._resize_job = None
+        self._hover_page = None
         self._page_cols_cur = self._page_cols()
         for w in list(self.pages_area.winfo_children()):
             try:
@@ -6531,10 +6652,13 @@ class ScanSection(BaseSection):
             except Exception:
                 pass
         self._page_cards.clear()
+        self._card_backlog.clear()
         self._page_sel = {p for p in self._page_sel if p in self.pages}
-        for idx, p in enumerate(self.pages):
-            self._make_page_card(idx, p)
-        self.pages_count.configure(text=str(len(self.pages)))
+        self._queue_cards(self.pages)
+        self._pages_changed()
+
+    def _pages_changed(self):
+        self._update_count()
         try:
             if self.pages:
                 self.pages_hint.place_forget()
@@ -6543,28 +6667,100 @@ class ScanSection(BaseSection):
         except Exception:
             pass
 
+    def _queue_cards(self, paths):
+        """Карточки создаются порциями: сотня страниц не замораживает окно
+        (одна карточка — несколько CTk-виджетов, ~30 мс)."""
+        self._card_backlog.extend(p for p in paths if p not in self._page_cards)
+        if self._card_backlog and self._card_job is None:
+            self._card_job = self.after_idle(self._drain_cards)
+
+    def _drain_cards(self):
+        self._card_job = None
+        deadline = time.perf_counter() + 0.05
+        while self._card_backlog and time.perf_counter() < deadline:
+            path = self._card_backlog.pop(0)
+            if path in self.pages and path not in self._page_cards:
+                try:
+                    self._make_page_card(self.pages.index(path), path)
+                except Exception as e:
+                    _log_exc("page card", e)
+        if self._card_backlog:
+            self._card_job = self.after(15, self._drain_cards)
+        elif self._scroll_after_cards:
+            self._scroll_after_cards = False
+            self._scroll_pages_to_end()
+
+    def _cards_ready(self) -> bool:
+        return not self._card_backlog and all(p in self._page_cards for p in self.pages)
+
+    def _update_count(self):
+        """Счётчик раздела — страницы и выделение (self.files здесь пуст)."""
+        label = getattr(self, "pages_count", None)
+        if label is None:
+            return
+        total = len(self.pages)
+        n = sum(1 for p in self.pages if p in self._page_sel)
+        try:
+            label.configure(text=t("pages_selected").format(n=n, total=total) if n else str(total),
+                            text_color=CLR_ACC if n else CLR_MUTED)
+        except Exception:
+            pass
+
+    def _scroll_pages_to_end(self):
+        """Новая страница всегда на виду: сетка прокручивается к концу."""
+        if self._card_backlog:
+            self._scroll_after_cards = True
+            return
+
+        def go():
+            try:
+                canvas = self.pages_area._parent_canvas
+                canvas.update_idletasks()
+                canvas.configure(scrollregion=canvas.bbox("all"))
+                canvas.yview_moveto(1.0)
+            except Exception as e:
+                _log_exc("scroll pages", e)
+        self.after(30, go)
+
     def _make_page_card(self, idx: int, path: str):
-        sel = path in self._page_sel
         card = ctk.CTkFrame(self.pages_area, corner_radius=8, fg_color=CLR_ROW,
-                            border_width=2,
-                            border_color=(CLR_ACC if sel else CLR_ROW))
+                            border_width=2, border_color=CLR_ROW_BORDER)
         cols = self._page_cols_cur
         card.grid(row=idx // cols, column=idx % cols, padx=5, pady=5)
         img = ctk.CTkLabel(card, text="…", width=92, height=118,
                            corner_radius=4, fg_color=CLR_GHOST,
                            text_color=CLR_MUTED)
-        img.pack(padx=5, pady=(5, 2))
-        num = ctk.CTkLabel(card, text=str(idx + 1), text_color=CLR_MUTED,
+        img.pack(padx=5, pady=(5, 0))
+        # низ карточки: ○ номер ↺ ↻ — отметить или повернуть одну
+        # страницу, не трогая остальной выбор
+        foot = ctk.CTkFrame(card, fg_color="transparent")
+        foot.pack(fill="x", padx=3, pady=(2, 4))
+        check = ctk.CTkCheckBox(foot, text="", width=22, checkbox_width=18,
+                                checkbox_height=18, corner_radius=9, border_width=2,
+                                fg_color=CLR_ACC, hover_color=CLR_ACC_HOVER,
+                                border_color=CLR_MUTED, checkmark_color=CLR_ACC_TEXT,
+                                command=lambda p=path: self._toggle_page(p))
+        check.pack(side="left", padx=(2, 0))
+        rot = dict(text="", width=24, height=24, corner_radius=6,
+                   fg_color="transparent", hover_color=CLR_GHOST_HOVER)
+        ctk.CTkButton(foot, image=icon("rot_r", 14),
+                      command=lambda p=path: self._rotate_pages([p], 270),
+                      **rot).pack(side="right")
+        ctk.CTkButton(foot, image=icon("rot_l", 14),
+                      command=lambda p=path: self._rotate_pages([p], 90),
+                      **rot).pack(side="right")
+        num = ctk.CTkLabel(foot, text=str(idx + 1), text_color=CLR_MUTED,
                            font=ctk.CTkFont(size=12, weight="bold"))
-        num.pack(pady=(0, 4))
+        num.pack(side="left", expand=True)
         card._nexus_page = path  # для поиска цели при перетаскивании
-        self._page_cards[path] = {"card": card, "img": img, "num": num}
+        self._page_cards[path] = {"card": card, "img": img, "num": num, "check": check}
+        self._paint_selection(path)
         cached = self._thumb_cache.get(path)
         if cached is not None:
             img.configure(image=cached, text="")
         else:
             self._thumb_request(path, (92, 118), ("page", path))
-        for w in [card] + list(card.winfo_children()):
+        for w in (card, img, num, foot):
             try:
                 w.bind("<ButtonPress-1>",
                        lambda e, p=path: self._page_press(e, p))
@@ -6573,6 +6769,8 @@ class ScanSection(BaseSection):
                        lambda e, p=path: self._page_release(e, p))
             except Exception:
                 pass
+        if self._dnd_out:
+            self._register_drag_source(path, (card, img, num, foot))
 
     def _apply_thumb(self, key, pil, disp):
         kind, ident = key
@@ -6592,85 +6790,340 @@ class ScanSection(BaseSection):
             return
         super()._apply_thumb(key, pil, disp)
 
-    # выбор кликом / порядок перетаскиванием
-    def _page_press(self, e, path):
-        self._drag = {"path": path, "moved": False,
-                      "x": e.x_root, "y": e.y_root}
+    # ---- выбор: как в Проводнике ----
+    # щелчок — только эта страница (повторный — снять), Ctrl — добавить,
+    # Shift — диапазон от предыдущего щелчка, кружок — добавить/убрать
 
-    def _page_motion(self, e):
-        d = self._drag
-        if d["path"] and (abs(e.x_root - d["x"]) > 14 or
-                          abs(e.y_root - d["y"]) > 14):
-            d["moved"] = True
-
-    def _page_release(self, e, path):
-        d = self._drag
-        self._drag = {"path": None, "moved": False, "x": 0, "y": 0}
-        if not d["path"]:
+    def _page_click(self, path: str, state: int = 0):
+        if path not in self.pages:
             return
-        if not d["moved"]:
-            if path in self._page_sel:
-                self._page_sel.discard(path)
-            else:
-                self._page_sel.add(path)
-            self._paint_selection(path)
-            return
-        target = None
-        try:
-            w = self.winfo_containing(e.x_root, e.y_root)
-            while w is not None:
-                tp = getattr(w, "_nexus_page", None)
-                if tp is not None:
-                    target = tp
-                    break
-                w = w.master
-        except Exception:
-            pass
-        if target and target != d["path"]:
-            self._reorder_pages(d["path"], target)
+        shift, ctrl = bool(state & 0x0001), bool(state & 0x0004)
+        if shift and self._sel_anchor in self.pages:
+            a, b = sorted((self.pages.index(self._sel_anchor), self.pages.index(path)))
+            span = set(self.pages[a:b + 1])
+            self._page_sel = (self._page_sel | span) if ctrl else span
+        elif ctrl:
+            self._page_sel ^= {path}
+            self._sel_anchor = path
+        else:
+            self._page_sel = set() if self._page_sel == {path} else {path}
+            self._sel_anchor = path
+        self._paint_all_selection()
 
-    def _paint_selection(self, path):
-        cd = self._page_cards.get(path)
-        if cd:
-            cd["card"].configure(border_color=(CLR_ACC if path in self._page_sel
-                                               else CLR_ROW))
+    def _toggle_page(self, path: str):
+        self._page_click(path, 0x0004)
+
+    def _clear_selection(self):
+        if self._page_sel:
+            self._page_sel = set()
+            self._paint_all_selection()
 
     def _select_all_pages(self):
         if self.pages and len(self._page_sel) == len(self.pages):
-            self._page_sel.clear()
+            self._page_sel = set()
         else:
             self._page_sel = set(self.pages)
+        self._paint_all_selection()
+
+    def _hotkey_select_all(self):
+        # Ctrl+A в поле ввода (папка, DPI) выделяет текст, а не страницы
+        if isinstance(self.focus_get(), (tk.Entry, tk.Text)):
+            return
+        if self.pages:
+            self._page_sel = set(self.pages)
+            self._paint_all_selection()
+
+    def _paint_selection(self, path):
+        cd = self._page_cards.get(path)
+        if not cd:
+            return
+        sel = path in self._page_sel
+        hover = path == self._hover_page
+        if cd.get("painted") == (sel, hover):
+            return  # перерисовка сотни карточек на каждый щелчок заметна
+        cd["painted"] = (sel, hover)
+        border = CLR_WARN if hover else (CLR_ACC if sel else CLR_ROW_BORDER)
+        try:
+            cd["card"].configure(fg_color=CLR_ACC_SOFT if sel else CLR_ROW,
+                                 border_color=border)
+            if sel:  # select()/deselect() не вызывают command
+                cd["check"].select()
+            else:
+                cd["check"].deselect()
+        except Exception as e:
+            _log_exc("paint page", e)
+
+    def _paint_all_selection(self):
         for p in self.pages:
             self._paint_selection(p)
+        self._update_count()
 
-    def _reorder_pages(self, src: str, target: str):
-        try:
-            self.pages.remove(src)
-            self.pages.insert(self.pages.index(target), src)
-        except ValueError:
+    # ---- мышь: щелчок и (без tkdnd) перетаскивание внутри сетки ----
+
+    def _page_press(self, e, path):
+        self._drag = {"path": path, "moved": False, "x": e.x_root,
+                      "y": e.y_root, "state": int(getattr(e, "state", 0) or 0)}
+
+    def _page_motion(self, e):
+        d = self._drag
+        if not d["path"] or self._dnd_out:
+            return  # с tkdnd перетаскиванием управляет система (_on_drag_init)
+        if d["moved"] or abs(e.x_root - d["x"]) > 14 or abs(e.y_root - d["y"]) > 14:
+            d["moved"] = True
+            self._drop_hover(e.x_root, e.y_root)
+
+    def _page_release(self, e, path):
+        d = self._drag
+        self._drag = {"path": None, "moved": False, "x": 0, "y": 0, "state": 0}
+        if not d["path"]:
             return
+        if not d["moved"]:
+            self._page_click(path, d.get("state", 0))
+            return
+        self._drop_hover(None, None)
+        kind, target = self._drop_target_at(e.x_root, e.y_root)
+        if kind == "card" and target != d["path"]:
+            self._move_pages(d["path"], target)
+        elif kind == "area":
+            self._move_pages(d["path"], None)
+
+    def _drop_target_at(self, x, y):
+        """("card", путь) над карточкой, ("area", None) над пустым местом
+        сетки, (None, None) — вне сетки."""
+        try:
+            w = self.winfo_containing(int(x), int(y))
+        except Exception:
+            w = None
+        canvas = self.pages_area._parent_canvas
+        while w is not None:
+            page = getattr(w, "_nexus_page", None)
+            if page is not None:
+                return ("card", page) if page in self.pages else (None, None)
+            if w is self.pages_area or w is canvas:
+                return "area", None
+            w = getattr(w, "master", None)
+        return None, None
+
+    def _drop_hover(self, x, y):
+        """Подсветить, куда встанет страница, и прокрутить сетку у краёв.
+        Для tkdnd возвращает действие: вне сетки бросить нельзя."""
+        kind, target = (None, None) if x is None else self._drop_target_at(x, y)
+        old, self._hover_page = self._hover_page, target
+        if old != target:
+            if old:
+                self._paint_selection(old)
+            if target:
+                self._paint_selection(target)
+        if x is not None:
+            self._autoscroll_pages(x, y)
+        return "copy" if kind else "refuse_drop"
+
+    def drop_hover(self, x, y):
+        """<<DropPosition>>/<<DropLeave>> окна: только для своих страниц."""
+        if not self._drag_out:
+            return None
+        return self._drop_hover(x, y)
+
+    def _autoscroll_pages(self, x, y):
+        now = time.monotonic()
+        if now - self._last_autoscroll < 0.06:
+            return
+        try:
+            canvas = self.pages_area._parent_canvas
+            left, top = canvas.winfo_rootx(), canvas.winfo_rooty()
+            w, h = canvas.winfo_width(), canvas.winfo_height()
+            if not left <= x < left + w:
+                return
+            zone = max(24, h // 8)
+            if top <= y < top + zone:
+                canvas.yview_scroll(-1, "units")
+            elif top + h - zone < y <= top + h:
+                canvas.yview_scroll(1, "units")
+            else:
+                return
+            self._last_autoscroll = now
+        except Exception:
+            pass
+
+    def _move_pages(self, src: str, target: Optional[str]):
+        """Поставить страницу на место target (вся выделенная группа едет
+        вместе, если src в ней). target=None — в конец."""
+        if src not in self.pages:
+            return
+        block = [p for p in self.pages if p in self._page_sel] \
+            if src in self._page_sel else [src]
+        if target in block:
+            return
+        rest = [p for p in self.pages if p not in block]
+        if target is None or target not in rest:
+            at = len(rest)
+        else:
+            at = rest.index(target)
+            # вперёд — встаём ПОСЛЕ цели, иначе в конец было бы не попасть
+            if self.pages.index(src) < self.pages.index(target):
+                at += 1
+        order = rest[:at] + block + rest[at:]
+        if order == self.pages:
+            return
+        self.pages[:] = order
         ScanSessionStore.save(self.pages)
         self._relayout_pages()  # без пересоздания — мгновенно
+
+    # ---- перетаскивание наружу (tkdnd): экспорт страниц файлами ----
+    # Один жест: за окном — файлы (PDF/JPG) уходят в Проводник, письмо,
+    # мессенджер; внутри сетки — свои же файлы опознаются и страница
+    # просто переставляется (accept_own_drop), копии не импортируются.
+
+    def _register_drag_source(self, path, widgets):
+        for w in widgets:
+            # события мыши получают внутренние tk-виджеты CTk
+            for tw in (w, getattr(w, "_canvas", None), getattr(w, "_label", None)):
+                if tw is None:
+                    continue
+                try:
+                    tw.drag_source_register(1, DND_FILES)
+                    tw.dnd_bind("<<DragInitCmd>>", lambda e, p=path: self._on_drag_init(e, p))
+                    tw.dnd_bind("<<DragEndCmd>>", self._on_drag_end)
+                except Exception as e:
+                    _log_exc("drag source", e)
+                    return
+
+    def _drag_format(self) -> str:
+        return "jpg" if self.drag_fmt_var.get() == "JPG" else "pdf"
+
+    def _on_drag_init(self, _event, path):
+        state = self._drag.get("state", 0)
+        if path not in self.pages:
+            return "refuse_drop"
+        try:
+            pages, files = self._export_pages(path)
+        except Exception as e:
+            _log_exc("drag export", e)
+            pages, files = [], []
+        if not files:
+            self._drag_out = None
+            return "refuse_drop"
+        self._drag_out = {"source": path, "pages": pages, "state": state,
+                          "files": {os.path.normcase(os.path.abspath(f)) for f in files}}
+        fmt = self._drag_format()
+        settings = load_settings()
+        if settings.get("scan_drag_format") != fmt:
+            settings["scan_drag_format"] = fmt
+            save_settings(settings)
+        return (("copy",), (DND_FILES,), tuple(files))
+
+    def _on_drag_end(self, event):
+        drag, self._drag_out = self._drag_out, None
+        self._drag = {"path": None, "moved": False, "x": 0, "y": 0, "state": 0}
+        self._drop_hover(None, None)
+        action = getattr(event, "action", "") if event is not None else ""
+        if drag and not drag.get("internal") and action in ("copy", "move", "link"):
+            self._log("⇱ " + t("drag_exported").format(n=len(drag["pages"])))
+
+    def accept_own_drop(self, paths, x_root, y_root) -> bool:
+        """Бросили свои же экспортированные страницы в окно — это перенос."""
+        drag = self._drag_out
+        if not drag:
+            return False
+        dropped = {os.path.normcase(os.path.abspath(p)) for p in paths}
+        if not dropped or not dropped <= drag["files"]:
+            return False
+        drag["internal"] = True
+        self._drop_hover(None, None)
+        kind, target = self._drop_target_at(x_root, y_root)
+        if kind == "card":
+            if target == drag["source"]:
+                # рука дрогнула при щелчке — это был щелчок
+                self._page_click(target, drag.get("state", 0))
+            else:
+                self._move_pages(drag["source"], target)
+        elif kind == "area":
+            self._move_pages(drag["source"], None)
+        return True
+
+    def _export_pages(self, path):
+        """Страницы для перетаскивания → временные файлы. Выделенная
+        страница тянет за собой всё выделение (в порядке листов)."""
+        pages = [p for p in self.pages if p in self._page_sel] \
+            if path in self._page_sel else [path]
+        root = TEMP_DIR / "drag_out"
+        self._sweep_drag_exports(root)
+        folder = root / str(time.time_ns())
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        numbers = [self.pages.index(p) + 1 for p in pages]
+        if self._drag_format() == "jpg":
+            files = []
+            for n, p in zip(numbers, pages):
+                out = str(folder / f"scan_{stamp}_p{n:02d}.jpg")
+                if self._plain_jpg(p, out, stop=None):
+                    files.append(out)
+            return pages, files
+        if len(numbers) == 1:
+            label = f"p{numbers[0]:02d}"
+        elif numbers == list(range(numbers[0], numbers[-1] + 1)):
+            label = f"p{numbers[0]:02d}-{numbers[-1]:02d}"
+        else:
+            label = f"{len(numbers)}p"
+        out = str(folder / f"scan_{stamp}_{label}.pdf")
+        # собственный флаг остановки: «Стоп» другой задачи не мешает экспорту
+        ok, msg, _added, _skipped = nexus_media.images_to_pdf(_DetachedContext(), pages, out)
+        if not ok:
+            self._log("✗ " + tr_msg(msg))
+            return pages, []
+        return pages, [out]
+
+    @staticmethod
+    def _sweep_drag_exports(root: Path):
+        """Проводник копирует файлы и после отпускания кнопки — старые
+        экспорты убираем только через полчаса (и при выходе с TEMP_DIR)."""
+        try:
+            for item in root.iterdir():
+                if item.is_dir() and time.time() - item.stat().st_mtime > 1800:
+                    shutil.rmtree(item, ignore_errors=True)
+        except OSError:
+            pass
+
+    # ---- поворот, порядок, удаление ----
+
+    def _can_edit_pages(self) -> bool:
+        """Поворачивать можно и во время сканирования: это запись угла (или
+        копия картинки со стороны) и приходу страниц не мешает."""
+        if app_closing.is_set():
+            return False
+        busy = self.app.busy_section() if hasattr(self.app, "busy_section") else None
+        saving = self.is_running and self._job is None
+        if self._edit_busy or self._recovery_busy or saving or \
+                (busy is not None and busy is not self):
+            self.show_toast(t("other_task_running"), "warn")
+            return False
+        return True
 
     def _rotate_selected(self, degrees: int):
         targets = [p for p in self.pages if p in self._page_sel]
         if not targets:
             self.show_toast(t("select_pages_first"), "warn")
             return
-        if not self._can_begin():
+        self._rotate_pages(targets, degrees)
+
+    def _rotate_pages(self, paths, degrees: int):
+        wanted = set(paths)
+        targets = [p for p in self.pages if p in wanted]
+        if not targets or not self._can_edit_pages():
             return
         self._edit_busy = True
 
         def work():
             mapping = {}
-            for p in targets:
-                if stop_flag.is_set():
-                    break
-                try:
-                    mapping[p] = rotate_page_file(p, degrees, ScanSessionStore.DIR)
-                except Exception as e:
-                    _log_exc("rotate page", e)
-            self.msg_queue.put(("scan_rotated", mapping))
+            try:
+                for p in targets:
+                    try:
+                        mapping[p] = rotate_page_file(p, degrees, ScanSessionStore.DIR,
+                                                      cancellable=False)
+                    except Exception as e:
+                        _log_exc("rotate page", e)
+            finally:
+                self.msg_queue.put(("scan_rotated", mapping))
 
         self._start_task(work)
 
@@ -6678,25 +7131,33 @@ class ScanSection(BaseSection):
         self._edit_busy = False
         if not mapping:
             return
-        copied = any(old != new for old, new in mapping.items())
-        self.pages = [mapping.get(path, path) for path in self.pages]
+        self.pages[:] = [mapping.get(path, path) for path in self.pages]
         self._page_sel = {mapping.get(path, path) for path in self._page_sel}
+        if self._sel_anchor in mapping:
+            self._sel_anchor = mapping[self._sel_anchor]
         for old in mapping:
             self._thumb_cache.pop(old, None)
         ScanSessionStore.save(self.pages)
-        if copied:
-            self._refresh_pages_ui()
-        else:
-            # Repaint only changed thumbnails rather than recreating a whole scan run.
-            for path in mapping.values():
-                card = self._page_cards.get(path)
-                if card:
-                    # Keep the live Tk image until its replacement arrives.
-                    # CTkLabel(image=None) does not clear the native image.
-                    self._thumb_request(path, (92, 118), ("page", path))
+        for old, new in mapping.items():
+            if old != new:
+                # картинка со стороны стала копией сеанса — новая карточка
+                # на том же месте, остальные не пересоздаются
+                cd = self._page_cards.pop(old, None)
+                if cd:
+                    cd["card"].destroy()
+                if new in self.pages and new not in self._page_cards:
+                    self._make_page_card(self.pages.index(new), new)
+            elif new in self._page_cards:
+                # Keep the live Tk image until its replacement arrives.
+                # CTkLabel(image=None) does not clear the native image.
+                self._thumb_request(new, (92, 118), ("page", new))
+        self._update_count()
 
     def _restore_original(self):
         if self.is_running:
+            return
+        if not self._page_sel:
+            self.show_toast(t("select_pages_first"), "warn")
             return
         mapping = {}
         for path in self.pages:
@@ -6720,14 +7181,24 @@ class ScanSection(BaseSection):
     def _remove_pages(self):
         if self.is_running:
             return
+        if not self._page_sel:
+            self.show_toast(t("select_pages_first"), "warn")
+            return
         for path in list(self._page_sel):
             ScanSessionStore.recover_page(path)
             if path in self.pages:
                 self.pages.remove(path)
             self._thumb_cache.pop(path, None)
+            cd = self._page_cards.pop(path, None)
+            if cd:
+                cd["card"].destroy()
+            if path == self._hover_page:
+                self._hover_page = None
         self._page_sel.clear()
         ScanSessionStore.save(self.pages)
-        self._refresh_pages_ui()
+        # остальные карточки только сдвигаются на освободившиеся места
+        self._relayout_pages()
+        self._pages_changed()
         self._update_recovery()
 
     def _clear_pages(self):
@@ -6804,6 +7275,9 @@ class ScanSection(BaseSection):
                     pages, raw_pdf if compress else out_pdf,
                     progress_cb=lambda i, n: self.msg_queue.put(
                         ("progress", span * i / max(1, n), f"{i}/{n}")))
+                if msg == "stopped":
+                    self.msg_queue.put(("stopped", None))
+                    return
                 if not ok:
                     self.msg_queue.put(("log", f"✗ {tr_msg(msg)}"))
                     self.msg_queue.put(("toast", tr_msg(msg), "err", None))
@@ -6815,6 +7289,7 @@ class ScanSection(BaseSection):
                             ("progress", 0.5 + 0.5 * f, f"{int(f * 100)}%")),
                         threads=min(4, MAX_WORKERS))
                     if msg2 == "stopped" or stop_flag.is_set():
+                        self.msg_queue.put(("stopped", None))
                         return
                     if not ok2:
                         if msg2 != "err_no_gain":
@@ -6911,7 +7386,7 @@ class ScanSection(BaseSection):
         self._start_task(work)
 
     @staticmethod
-    def _plain_jpg(src: str, out: str) -> bool:
+    def _plain_jpg(src: str, out: str, stop=stop_flag) -> bool:
         if paths_alias(src, out):
             return False
         try:
@@ -6925,7 +7400,7 @@ class ScanSection(BaseSection):
                 image.paste(rgba, mask=rgba.getchannel("A"))
             elif image.mode not in ("L", "RGB"):
                 image = image.convert("RGB")
-            with AtomicOutput(out, TEMP_DIR, stop_flag) as stage:
+            with AtomicOutput(out, TEMP_DIR, stop) as stage:
                 if copy_jpeg:
                     shutil.copy2(src, stage.path)
                 else:
@@ -6976,6 +7451,7 @@ class ScanSection(BaseSection):
         self.pap_var.set(self._label_for(self._pap_map, s.get("scan_paper"), "A4"))
         self.deskew_var.set(bool(s.get("scan_deskew", True)))
         self.blank_var.set(bool(s.get("scan_skip_blank", True)))
+        self.drag_fmt_var.set("JPG" if s.get("scan_drag_format") == "jpg" else "PDF")
         self._toggle_comp_ui()
         self._toggle_ui_mode()
 
@@ -6998,6 +7474,7 @@ class ScanSection(BaseSection):
             "scan_paper": opts["paper"],
             "scan_deskew": self.deskew_var.get(),
             "scan_skip_blank": self.blank_var.get(),
+            "scan_drag_format": self._drag_format(),
             "theme": ctk.get_appearance_mode(),
         })
         dev = self._selected_device() if hasattr(self, "dev_list") else None
@@ -7521,12 +7998,16 @@ class App(TkinterDnD.DnDWrapper, ctk.CTk):
                 self._sections[name].add_paths(saved)
         self.current = self._sections[name]
         self.current.pack(fill="both", expand=True)
-        for key in ("<Control-Return>", "<Delete>", "<Control-o>", "<Escape>"):
+        for key in ("<Control-Return>", "<Delete>", "<Control-o>", "<Escape>",
+                    "<Control-a>", "<Control-A>"):
             self.unbind(key)
         if hasattr(self.current, "_ev"):
             self.bind("<Control-Return>", self.current._ev(self.current._start))
             self.bind("<Delete>", self.current._ev(self.current._remove))
             self.bind("<Control-o>", self.current._ev(self.current._add))
+        if hasattr(self.current, "_hotkey_select_all"):
+            for key in ("<Control-a>", "<Control-A>"):
+                self.bind(key, self.current._ev(self.current._hotkey_select_all))
         self.bind("<Escape>", lambda event: self._cancel_current_task())
         settings = load_settings()
         settings["last_section"] = name
@@ -7618,8 +8099,15 @@ class App(TkinterDnD.DnDWrapper, ctk.CTk):
             self.TkdndVersion = TkinterDnD._require(self)
             self.drop_target_register(DND_FILES)
             self.dnd_bind("<<Drop>>", self._on_tkdnd)
+            self.dnd_bind("<<DropPosition>>", self._on_tkdnd_position)
+            self.dnd_bind("<<DropLeave>>", self._on_tkdnd_leave)
+            # перетаскивание страниц наружу: щелчок с дрожью руки (3 px по
+            # умолчанию) не должен превращаться в перетаскивание
+            self.tk.call("set", "::tkdnd::_dx", 8)
+            self.tk.call("set", "::tkdnd::_dy", 8)
             log.info("tkdnd %s ready", self.TkdndVersion)
         except Exception as e:
+            self.TkdndVersion = None
             _log_exc("tkdnd init", e)
 
     def _on_tkdnd(self, event):
@@ -7627,7 +8115,35 @@ class App(TkinterDnD.DnDWrapper, ctk.CTk):
             paths = list(self.tk.splitlist(event.data))
         except Exception:
             paths = _brace_parse(str(event.data))
+        own = getattr(self.current, "accept_own_drop", None)
+        if own is not None:
+            try:
+                # свои страницы, брошенные обратно в окно, — это перенос,
+                # а не импорт копий
+                if own(paths, event.x_root, event.y_root):
+                    return
+            except Exception as e:
+                _log_exc("own drop", e)
         self._dispatch(paths)
+
+    def _on_tkdnd_position(self, event):
+        hover = getattr(self.current, "drop_hover", None)
+        if hover is not None:
+            try:
+                action = hover(event.x_root, event.y_root)
+                if action:
+                    return action
+            except Exception as e:
+                _log_exc("drop position", e)
+        return event.action
+
+    def _on_tkdnd_leave(self, _event):
+        hover = getattr(self.current, "drop_hover", None)
+        if hover is not None:
+            try:
+                hover(None, None)
+            except Exception as e:
+                _log_exc("drop leave", e)
 
     def _dispatch(self, paths):
         cur = self.current

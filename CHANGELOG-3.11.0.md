@@ -1,0 +1,12 @@
+# Nexus Optimizer 3.11.0
+
+- Scanner: every page thumbnail stays reachable. The page grid's own resize handler had replaced the scroll-region update, so pages beyond the window were scanned and saved but never shown. New pages, including dropped pictures, scroll into view as they arrive.
+- Scanner selection works like Explorer: click selects one page (again to clear), Ctrl adds, Shift selects a range, Ctrl+A selects all, a click on empty space clears. Each card has a round check mark for selecting without the keyboard and its own ↺ ↻ buttons. The header shows "3 of 30 selected"; Remove/Restore without a selection explain what to do.
+- Rotation: 180° for an upside-down stack; rotating is allowed while a scan is still running and is no longer silently skipped after an earlier Stop; only changed cards are redrawn.
+- Reordering: dropping a page onto a later card takes that card's place, so a page can now reach the last position; a selected group moves as one block; the target card is highlighted and the grid scrolls at its edges.
+- Drag and drop out of the window: drag a page, or the selection, to Explorer, the desktop, an e-mail or a messenger to export it as one PDF or as JPG files (Scanner settings → "Drag out as"). Rotation is applied, the scans are not recompressed. Dropping the pages back into the grid reorders them instead of importing copies.
+- The same picture is not added twice as a page.
+- Large sessions stay responsive: adding, removing or selecting a page updates only the affected cards instead of rebuilding the grid (150 pages: adding or removing one page went from about 5 s to 0.1 s, a click from 0.5 s to under 10 ms); big batches of cards appear progressively without freezing the window.
+- Photo and PDF lists follow their results: after compression the original is moved to original/ (or renamed), and Merge into one PDF, Compare and Remove now use the compressed file instead of a path that no longer exists. Previously only uncompressed ("already optimized") files reached the merged PDF. Starting again skips files already compressed instead of compressing the results a second time. The merge dialog opens in the files' folder.
+- Stopping "Save PDF" in the scanner reports Stopped and resets the progress.
+- Verification: tests/test_pages_ui.py (thumbnail reachability, selection, rotation, reordering, drag-out export and own-drop reorder, merge after compression).

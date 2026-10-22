@@ -114,9 +114,9 @@ user by default and needs no administrator rights.
 Silent install:
 
 ```powershell
-NexusOptimizer-Setup-3.10.2.exe /S
-NexusOptimizer-Setup-3.10.2.exe /S /allusers /nodesktop
-NexusOptimizer-Setup-3.10.2.exe /S /dir="C:\Apps\Nexus Optimizer" /nomenu
+NexusOptimizer-Setup-3.11.0.exe /S
+NexusOptimizer-Setup-3.11.0.exe /S /allusers /nodesktop
+NexusOptimizer-Setup-3.11.0.exe /S /dir="C:\Apps\Nexus Optimizer" /nomenu
 ```
 
 ## Building from source
