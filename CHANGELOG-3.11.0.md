@@ -1,7 +1,7 @@
 # Nexus Optimizer 3.11.0
 
 - Scanner: every page thumbnail stays reachable. The page grid's own resize handler had replaced the scroll-region update, so pages beyond the window were scanned and saved but never shown. New pages, including dropped pictures, scroll into view as they arrive.
-- Scanner selection works like Explorer: click selects one page (again to clear), Ctrl adds, Shift selects a range, Ctrl+A selects all, a click on empty space clears. Each card has a round check mark for selecting without the keyboard and its own ↺ ↻ buttons. The header shows "3 of 30 selected"; Remove/Restore without a selection explain what to do.
+- Scanner selection works like Explorer: click selects one page (again to clear), Ctrl adds, Shift selects a range, Ctrl+A selects all, a click on empty space clears. Each card has a round check mark for selecting without the keyboard and its own ↺ ↻ buttons. A status line under the buttons shows "3 of 30 selected" or the drag hint; Remove/Restore without a selection explain what to do.
 - Rotation: 180° for an upside-down stack; rotating is allowed while a scan is still running and is no longer silently skipped after an earlier Stop; only changed cards are redrawn.
 - Reordering: dropping a page onto a later card takes that card's place, so a page can now reach the last position; a selected group moves as one block; the target card is highlighted and the grid scrolls at its edges.
 - Drag and drop out of the window: drag a page, or the selection, to Explorer, the desktop, an e-mail or a messenger to export it as one PDF or as JPG files (Scanner settings → "Drag out as"). Rotation is applied, the scans are not recompressed. Dropping the pages back into the grid reorders them instead of importing copies.
