@@ -6045,12 +6045,12 @@ class ScanSection(BaseSection):
                   command=self._clear_pages).grid(row=1, column=2, padx=2, pady=2)
         btn_ghost(br, text=t("restore_original"), width=130,
                   command=self._restore_original).grid(row=1, column=3, padx=2, pady=2)
-        if self._dnd_out:
-            # колонка с весом: в узком окне сжимается она, а не кнопки
-            br.grid_columnconfigure(4, weight=1)
-            ctk.CTkLabel(br, text=t("pages_dnd_hint"), text_color=CLR_MUTED,
-                         font=ctk.CTkFont(size=11), wraplength=240, justify="left",
-                         anchor="w").grid(row=0, column=4, rowspan=2, sticky="w", padx=(10, 0))
+        # строка состояния: «Выбрано 3 из 30» или подсказка про перетаскивание.
+        # Отдельной строкой — в шапке и справа от кнопок в окне 1000 px не
+        # помещалась.
+        self.sel_label = ctk.CTkLabel(br, text="", text_color=CLR_MUTED,
+                                      font=ctk.CTkFont(size=11), anchor="w")
+        self.sel_label.grid(row=2, column=0, columnspan=4, sticky="w", padx=4)
 
         # Страницы — сетка миниатюр: клик = выбор, перетаскивание = порядок
         self.pages_area = ctk.CTkScrollableFrame(right, fg_color=CLR_LIST_BG,
@@ -6694,15 +6694,20 @@ class ScanSection(BaseSection):
         return not self._card_backlog and all(p in self._page_cards for p in self.pages)
 
     def _update_count(self):
-        """Счётчик раздела — страницы и выделение (self.files здесь пуст)."""
+        """Счётчик раздела — страницы (self.files здесь пуст) и выделение."""
         label = getattr(self, "pages_count", None)
         if label is None:
             return
         total = len(self.pages)
         n = sum(1 for p in self.pages if p in self._page_sel)
         try:
-            label.configure(text=t("pages_selected").format(n=n, total=total) if n else str(total),
-                            text_color=CLR_ACC if n else CLR_MUTED)
+            label.configure(text=str(total))
+            if n:
+                self.sel_label.configure(text=t("pages_selected").format(n=n, total=total),
+                                         text_color=CLR_ACC)
+            else:
+                self.sel_label.configure(text=t("pages_dnd_hint") if self._dnd_out and total else "",
+                                         text_color=CLR_MUTED)
         except Exception:
             pass
 

@@ -126,8 +126,9 @@ def scenario(name, root):
             assert sec._page_sel == set(p[0:3]), sec._page_sel
             sec._page_click(p[5], state=0x0004)            # Ctrl: add
             assert sec._page_sel == set(p[0:3]) | {p[5]}
-            assert "4" in sec.pages_count.cget("text") and "6" in sec.pages_count.cget("text"), \
-                sec.pages_count.cget("text")
+            assert "4" in sec.sel_label.cget("text") and "6" in sec.sel_label.cget("text"), \
+                sec.sel_label.cget("text")
+            assert sec.pages_count.cget("text") == "6"
             sec._page_click(p[1])                          # plain click: only this one
             assert sec._page_sel == {p[1]}
             sec._page_click(p[1])                          # again: nothing selected
@@ -144,6 +145,7 @@ def scenario(name, root):
             assert sec._page_sel == {p[3], p[4]} and card["check"].get() == 1
             sec._clear_selection()
             assert sec._page_sel == set()
+            assert "4" not in sec.sel_label.cget("text")
 
             # Per-page rotation needs no selection; a picture dropped in from
             # outside is copied into the session first, the original stays.
