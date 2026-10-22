@@ -67,7 +67,7 @@ def scenario(name, root):
     source = root / "in"
     source.mkdir()
     app = nx.App()
-    app.geometry("1280x800+0+0")
+    app.geometry("1000x700+0+0")  # fits the 1024x768 CI desktop
     try:
         if name == "scroll":
             app.show("scan")
